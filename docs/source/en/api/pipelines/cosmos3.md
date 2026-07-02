@@ -738,6 +738,194 @@ pipe = Cosmos3OmniPipeline.from_pretrained(
 - all
 - __call__
 
+## Cosmos3OmniModularPipeline
+
+Cosmos 3 is also available as a Modular Diffusers pipeline. The task-based [`Cosmos3OmniPipeline`] remains available; the modular pipeline coexists with it and covers the same modes (`text2image`, `text2video`, `image2video`, `video2video`, and action-conditioned generation, with optional sound when supported by the checkpoint).
+
+```python
+import torch
+from diffusers import Cosmos3OmniModularPipeline
+
+pipe = Cosmos3OmniModularPipeline.from_pretrained(
+    "nvidia/Cosmos3-Nano", torch_dtype=torch.bfloat16
+)
+pipe.load_components(torch_dtype=torch.bfloat16)
+
+result = pipe(
+    prompt='{"scene":"A robot arm in a kitchen"}',
+    num_frames=1,
+    height=720,
+    width=1280,
+)
+
+# Same return payload as the task pipeline.
+image = result.video[0]
+```
+
+You can also load through [`ModularPipeline`] and let the repository config select the blocks class:
+
+```python
+import torch
+from diffusers import ModularPipeline
+
+pipe = ModularPipeline.from_pretrained("nvidia/Cosmos3-Nano", torch_dtype=torch.bfloat16)
+pipe.load_components(torch_dtype=torch.bfloat16)
+result = pipe(prompt='{"scene":"A robot arm in a kitchen"}', num_frames=1, height=720, width=1280)
+```
+
+To inspect or customize a specific Cosmos modular workflow, use `available_workflows` + `get_workflow()`:
+
+```python
+available = pipe.blocks.available_workflows
+image2video_blocks = pipe.blocks.get_workflow("image2video")
+```
+
+### Modular examples for all existing workflows
+
+The modular pipeline supports the same call signatures as the task pipeline. The snippets below mirror every generation example shown above (`text2video`, `text2image`, `image2video`, `video2video`, `video2video_sound`, `text2video_sound`, and `action_policy`).
+
+```python
+import json
+import torch
+from diffusers import Cosmos3OmniModularPipeline, CosmosActionCondition
+from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
+from diffusers.utils import encode_video, export_to_video, load_image, load_video
+
+pipe = Cosmos3OmniModularPipeline.from_pretrained("nvidia/Cosmos3-Nano", torch_dtype=torch.bfloat16)
+pipe.load_components(torch_dtype=torch.bfloat16)
+pipe.to("cuda")
+pipe.scheduler = UniPCMultistepScheduler.from_config(
+    pipe.scheduler.config, flow_shift=10.0, use_karras_sigmas=False
+)
+
+# text2video
+json_prompt = json.load(open("assets/example_t2v_prompt.json"))
+negative_prompt = json.load(open("assets/negative_prompt.json"))
+result = pipe(
+    prompt=json.dumps(json_prompt),
+    negative_prompt=json.dumps(negative_prompt),
+    num_frames=189,
+    height=720,
+    width=1280,
+    num_inference_steps=35,
+    guidance_scale=6.0,
+    fps=24.0,
+)
+export_to_video(result.video, "cosmos3_modular_t2v.mp4", fps=24, macro_block_size=1)
+
+# text2image
+json_prompt = json.load(open("assets/example_t2i_prompt.json"))
+result = pipe(prompt=json.dumps(json_prompt), num_frames=1, height=720, width=1280)
+result.video[0].save("cosmos3_modular_t2i.jpg", format="JPEG", quality=85)
+
+# image2video
+json_prompt = json.load(open("assets/example_i2v_prompt.json"))
+negative_prompt = json.load(open("assets/negative_prompt_i2v.json"))
+image = load_image("https://github.com/nvidia-cosmos/cosmos-dependencies/releases/download/assets/robot_153.jpg")
+result = pipe(
+    prompt=json.dumps(json_prompt),
+    negative_prompt=json.dumps(negative_prompt),
+    image=image,
+    num_frames=189,
+    height=720,
+    width=1280,
+    fps=24.0,
+)
+export_to_video(result.video, "cosmos3_modular_i2v.mp4", fps=24, macro_block_size=1)
+
+# video2video
+json_prompt = json.load(open("assets/example_v2v_prompt.json"))
+negative_prompt = json.load(open("assets/negative_prompt_i2v.json"))
+video = load_video(
+    "https://github.com/nvidia-cosmos/cosmos-dependencies/raw/refs/heads/assets/cosmos3/inputs/vision/robot_pouring.mp4"
+)
+result = pipe(
+    prompt=json.dumps(json_prompt),
+    negative_prompt=json.dumps(negative_prompt),
+    video=video,
+    condition_frame_indexes_vision=[0, 1],
+    condition_video_keep="first",
+    num_frames=189,
+    height=720,
+    width=1280,
+    num_inference_steps=35,
+    guidance_scale=6.0,
+    fps=24.0,
+)
+export_to_video(result.video, "cosmos3_modular_v2v.mp4", fps=24, macro_block_size=1)
+
+# video2video_sound
+result = pipe(
+    prompt=json.dumps(json_prompt),
+    negative_prompt=json.dumps(negative_prompt),
+    video=video,
+    condition_frame_indexes_vision=[0, 1],
+    condition_video_keep="first",
+    num_frames=189,
+    height=720,
+    width=1280,
+    fps=24.0,
+    enable_sound=True,
+)
+encode_video(
+    result.video,
+    fps=24,
+    audio=result.sound,
+    audio_sample_rate=pipe.sound_tokenizer.config.sampling_rate,
+    output_path="cosmos3_modular_v2v_with_sound.mp4",
+)
+
+# text2video_sound
+json_prompt = json.load(open("assets/example_t2v_sound_prompt.json"))
+negative_prompt = json.load(open("assets/negative_prompt.json"))
+result = pipe(
+    prompt=json.dumps(json_prompt),
+    negative_prompt=json.dumps(negative_prompt),
+    num_frames=189,
+    height=720,
+    width=1280,
+    fps=24.0,
+    enable_sound=True,
+)
+encode_video(
+    result.video,
+    fps=24,
+    audio=result.sound,
+    audio_sample_rate=pipe.sound_tokenizer.config.sampling_rate,
+    output_path="cosmos3_modular_t2v_with_sound.mp4",
+)
+
+# action_policy
+prompt = "Put the pot to the left of the purple item."
+action_video = load_video(
+    "https://github.com/nvidia-cosmos/cosmos-dependencies/raw/refs/heads/assets/cosmos3/inputs/action/bridge_20260501_0.mp4"
+)
+result = pipe(
+    prompt=prompt,
+    action=CosmosActionCondition(
+        mode="policy",
+        chunk_size=16,
+        domain_name="bridge_orig_lerobot",
+        resolution_tier=480,
+        video=action_video,
+        view_point="ego_view",
+    ),
+    fps=5,
+    num_inference_steps=30,
+    guidance_scale=1.0,
+    use_system_prompt=False,
+)
+export_to_video(result.video, "cosmos3_modular_action_policy.mp4", fps=5, macro_block_size=1)
+if result.action is not None:
+    with open("cosmos3_modular_action_policy.json", "w") as f:
+        json.dump(result.action[0].tolist(), f)
+```
+
+[[autodoc]] Cosmos3OmniModularPipeline
+
+- all
+- __call__
+
 ## CosmosActionCondition
 
 [[autodoc]] CosmosActionCondition
