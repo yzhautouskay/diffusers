@@ -107,6 +107,12 @@ def main():
         default=189,
         help="Number of frames to generate. Use 1 for text-to-image; defaults to 189 for video.",
     )
+    parser.add_argument(
+        "--num-video-frames-per-chunk",
+        type=int,
+        default=None,
+        help="Transfer frames generated per autoregressive chunk (defaults to all requested frames in one chunk).",
+    )
     parser.add_argument("--fps", type=float, default=24.0)
     parser.add_argument("--guidance-scale", type=float, default=6.0)
     parser.add_argument("--control-guidance", type=float, default=1.5)
@@ -152,6 +158,10 @@ def main():
         raise ValueError("Transfer requires a base Nano/Super checkpoint; distilled checkpoints are unsupported.")
     if is_transfer and args.vision_path is not None:
         raise ValueError("--vision-path and --control-video cannot be used together.")
+    if not is_transfer and args.num_video_frames_per_chunk is not None:
+        raise ValueError("--num-video-frames-per-chunk is only supported with --control-video.")
+    if args.num_video_frames_per_chunk is not None and args.num_video_frames_per_chunk < 1:
+        raise ValueError("--num-video-frames-per-chunk must be at least 1.")
     if args.model == "super-i2v-4step" and args.vision_path is None:
         raise ValueError("--vision-path is required for the distilled image-to-video checkpoint.")
     if args.num_iterations < 1:
@@ -224,6 +234,7 @@ def main():
             if is_transfer:
                 kwargs["control_videos"] = control_videos
                 kwargs["control_guidance"] = args.control_guidance
+                kwargs["num_video_frames_per_chunk"] = args.num_video_frames_per_chunk
             else:
                 kwargs["image"] = image
         return pipeline(**kwargs)

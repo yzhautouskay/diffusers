@@ -217,12 +217,16 @@ python examples/cosmos3/inference_cosmos3_modular.py \
     --prompt-path assets/edge/prompt.json \
     --negative-prompt-path assets/negative_prompt.json \
     --control-video edge=assets/edge/control_edge.mp4 \
-    --num-frames 121 --height 720 --width 1280 --fps 30 \
+    --num-frames 121 --num-video-frames-per-chunk 121 \
+    --height 720 --width 1280 --fps 30 \
     --num-inference-steps 35 --guidance-scale 3.0 \
     --control-guidance 1.5 --flow-shift 10.0 \
     --disable-safety-checker --warmup 1 --num-iterations 2 \
     --output outputs/transfer-edge/
 ```
+
+Set `--num-video-frames-per-chunk` below `--num-frames` to generate multiple autoregressive chunks.
+Each later chunk reuses the previous chunk's final frame, and the decoded chunks are stitched automatically.
 
 Point at a local snapshot with `--model-path`.
 See also [`docs/source/en/api/pipelines/cosmos3.md`](../../docs/source/en/api/pipelines/cosmos3.md#cosmos3omnimodularpipeline).
@@ -234,6 +238,7 @@ See also [`docs/source/en/api/pipelines/cosmos3.md`](../../docs/source/en/api/pi
 | `--prompt` | (required) | Text prompt. |
 | `--vision-path` | `None` | URL or local path for an image-conditioning frame (image-to-video), or the image/video conditioning for action modes. |
 | `--num-frames` | `189` | `1` = image, otherwise number of video frames (`189` ≈ 7.9 s @ 24 FPS). Ignored for action modes (derived from `--action-chunk-size`). |
+| `--num-video-frames-per-chunk` | `None` | Transfer frames per autoregressive chunk. Defaults to all requested frames in one chunk. |
 | `--height` / `--width` | `720` / `1280` | Output resolution (must be a multiple of the VAE spatial scale factor). Ignored for action modes; use `--resolution-tier`. |
 | `--resolution-tier` | `480` | Action resolution tier (`256`/`480`/`704`/`720`): selects the aspect bin / padded conditioning canvas, not the output size. |
 | `--fps` | `24.0` | Frame rate of the generated video. |
