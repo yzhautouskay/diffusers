@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Minimal smoke-test runner for the Cosmos3 diffusers pipeline.
+Minimal smoke-test runner for the Cosmos3 diffusers pipeline (task-based).
 
 Canonical examples live in the docs page at
 ``docs/source/en/api/pipelines/cosmos3.md`` — copy from there for production use.
-This script exists to exercise the full load → encode → denoise → decode path
-during development.
+This script exercises the task-based ``Cosmos3OmniPipeline`` for base Nano/Super
+checkpoints (T2I, T2V, I2V, V2V, action, sound).
+
+For distilled few-step checkpoints (T2I / I2V), use the modular pipeline instead:
+``inference_cosmos3_modular.py``.
 
 Text-to-image:
     python inference_cosmos3.py --prompt "A robot in a lab." --num-frames 1

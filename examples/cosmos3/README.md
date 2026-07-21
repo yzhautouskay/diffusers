@@ -1,13 +1,21 @@
-# Cosmos3 — smoke-test runner
+# Cosmos3 — smoke-test runners
 
 The canonical reference for `Cosmos3OmniPipeline` lives in the diffusers docs:
 [`docs/source/en/api/pipelines/cosmos3.md`](../../docs/source/en/api/pipelines/cosmos3.md). Use the
 examples there as the source of truth for application code — they cover text-to-image,
 text-to-video, image-to-video, and text+sound modes.
 
-This directory provides a small CLI wrapper (`inference_cosmos3.py`) that exercises the full
-load → encode → denoise → decode path against either the Hub release or a local checkpoint
-during development.
+This directory provides small CLI wrappers that exercise the full load → encode → denoise → decode
+path against either the Hub release or a local checkpoint during development.
+
+| Script | Pipeline | Use case |
+|---|---|---|
+| `inference_cosmos3.py` | task-based [`Cosmos3OmniPipeline`] | Base checkpoints (Nano/Super): T2I, T2V, I2V, V2V, action, sound |
+| `inference_cosmos3_modular.py` | modular [`Cosmos3OmniModularPipeline`] / [`Cosmos3DistilledModularPipeline`] | Base and distilled T2I/I2V, transfer, and E2E benchmarking |
+
+Distilled models are **not** supported through `inference_cosmos3.py`. Use the modular script
+above. It selects the dedicated [`Cosmos3DistilledModularPipeline`] for few-step checkpoints
+and [`Cosmos3OmniModularPipeline`] for base checkpoints and transfer.
 
 ## Setup
 
@@ -157,6 +165,67 @@ Pass `--prompt` as a plain task description and select the camera perspective wi
 `--resolution-tier` is a resolution *tier* (`256`/`480`/`704`/`720`). The tier keys a table of predefined aspect-ratio canvases; the one closest to the input aspect ratio becomes the padded conditioning canvas. It is not the output frame size: the input is downscaled (never upscaled) and padded to fill the canvas, then the padding is cropped from the latents so the decoded output follows the downscaled input content. `--height` / `--width` (and `--num-frames`) are ignored for action modes.
 
 Pick the tier that matches the native resolution of your conditioning input (`480` for ~480p, `720` for ~720p). A tier below your input downscales it and discards detail; a tier above your input gains no resolution (content is never upscaled), wastes compute on padding, and is a train/inference distribution mismatch that can degrade quality.
+
+## Modular pipeline benchmarks
+
+Few-step distilled Cosmos3 checkpoints (`nvidia/Cosmos3-Super-Text2Image-4Step`,
+`nvidia/Cosmos3-Super-Image2Video-4Step`) are served by the dedicated
+[`Cosmos3DistilledModularPipeline`]. Use `inference_cosmos3_modular.py` — not
+`inference_cosmos3.py`.
+
+Distilled inference reads `fixed_step_sampler_config` from the scheduler, fixes the step
+count, and forces `guidance_scale=1.0`, so do **not** pass `num_inference_steps`,
+`guidance_scale`, or `negative_prompt`.
+
+```bash
+# T2I distilled (benchmarking)
+python examples/cosmos3/inference_cosmos3_modular.py \
+    --model super-t2i-4step \
+    --prompt "A medium shot of a modern robotics research laboratory …" \
+    --num-frames 1 --height 720 --width 1280 \
+    --disable-safety-checker --warmup 2 --num-iterations 3 \
+    --output outputs/text2image/
+
+# I2V distilled (benchmarking)
+python examples/cosmos3/inference_cosmos3_modular.py \
+    --model super-i2v-4step \
+    --prompt "The video opens with a view of a testing environment …" \
+    --vision-path https://github.com/nvidia-cosmos/cosmos-dependencies/raw/refs/heads/assets/cosmos3/inputs/vision/robot_153.jpg \
+    --num-frames 189 --height 720 --width 1280 \
+    --disable-safety-checker --warmup 2 --num-iterations 3 \
+    --output outputs/image2video/
+```
+
+Transfer uses a base Nano/Super checkpoint and one or more precomputed control videos. Pass each
+control as `HINT=PATH`, where `HINT` is `edge`, `blur`, `depth`, `seg`, or `wsm`. JSON caption files
+are serialized for the pipeline automatically. Download the edge control video and captions from
+the Cosmos cookbook:
+
+```bash
+base=https://github.com/NVIDIA/cosmos/raw/refs/heads/main/cookbooks/cosmos3/generator/transfer/assets
+mkdir -p assets/edge
+curl -L "$base/edge/control_edge.mp4" -o assets/edge/control_edge.mp4
+curl -L "$base/edge/prompt.json" -o assets/edge/prompt.json
+curl -L "$base/negative_prompt.json" -o assets/negative_prompt.json
+```
+
+Then run the modular transfer benchmark:
+
+```bash
+python examples/cosmos3/inference_cosmos3_modular.py \
+    --model nano \
+    --prompt-path assets/edge/prompt.json \
+    --negative-prompt-path assets/negative_prompt.json \
+    --control-video edge=assets/edge/control_edge.mp4 \
+    --num-frames 121 --height 720 --width 1280 --fps 30 \
+    --num-inference-steps 35 --guidance-scale 3.0 \
+    --control-guidance 1.5 --flow-shift 10.0 \
+    --disable-safety-checker --warmup 1 --num-iterations 2 \
+    --output outputs/transfer-edge/
+```
+
+Point at a local snapshot with `--model-path`.
+See also [`docs/source/en/api/pipelines/cosmos3.md`](../../docs/source/en/api/pipelines/cosmos3.md#cosmos3omnimodularpipeline).
 
 ### Useful flags
 
