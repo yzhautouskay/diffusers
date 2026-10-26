@@ -725,124 +725,83 @@ pipe.transformer.compile_repeated_blocks(fullgraph=True)
 SeaCache also supports the Cosmos 3 Ulysses context-parallel and DTensor-based tensor-parallel helpers documented
 below. Cache decisions are synchronized across ranks. Full-model compilation and other model-sharding strategies are not claimed.
 
-## Context parallelism
+## Tensor parallelism
 
-For long videos or high resolutions, a single forward pass can exceed the memory and latency budget of one GPU. Cosmos 3 supports **context parallelism (CP)** to shard the sequence dimension across multiple GPUs, splitting the attention computation so each device holds only a slice of the tokens.
+Cosmos 3 supports native tensor parallelism (TP) through `TensorParallelConfig` and its model `_tp_plan`. Both streams' Q/K/V and MLP input projections use column sharding; attention output and MLP down projections use row sharding and reduction. Embeddings, final output heads, modality projections, and normalization weights remain replicated. Head reshaping uses the projection output's local width without changing checkpoint configuration.
 
-Cosmos 3 supports **Ulysses** context parallelism (all-to-all sequence/head exchange). Ring attention is not supported.
-
-Unlike most diffusers models, Cosmos 3 does **not** wire CP into the transformer or the declarative [`~ModelMixin.enable_parallelism`] path: its grouped-query attention, separate understanding/generation streams (the generation stream attends to both), and ragged per-stream lengths can't be expressed as a `_cp_plan`. Instead, the model exposes small no-op shard/gather seams, and the implementation lives in [`examples/cosmos3/cosmos_parallel.py`](https://github.com/huggingface/diffusers/blob/main/examples/cosmos3/cosmos_parallel.py) — a self-contained module you can read end to end and adapt. It offers two orthogonal, composable sharding axes:
-
-| Helper | Shards | Use for |
-|---|---|---|
-| `enable_cosmos3_context_parallel(transformer, cp_mesh)` | sequence (CP / Ulysses) | latency on a model that fits one GPU (`Nano`) |
-| `enable_cosmos3_tensor_parallel(transformer, tp_mesh)` | weights (TP) | fitting a model that doesn't fit one GPU (`Super`) |
-
-Use either alone or both together on a 2-D `(tp, cp)` mesh (see [Fitting large models with tensor parallelism](#fitting-large-models-with-tensor-parallelism)).
-
-Two requirements are specific to Cosmos 3:
-
-- Use the `native` attention backend. Cosmos 3 uses grouped-query attention (GQA), and the native SDPA backend is the only one that accepts `enable_gqa` (cuDNN and flash reject it). The helpers expand the KV heads to the query-head count and call SDPA with `enable_gqa=False` so it still dispatches to the flash kernel (the math fallback would materialize the full `[S, S]` scores and OOM on long sequences).
-- The CP (Ulysses) degree must divide the query-head count (32 for `Nano`, 64 for `Super`); for TP, the degree must divide the KV heads (8). The understanding (text) and generation (video/sound) streams are sharded independently along the sequence, and ragged lengths are zero-padded internally to a multiple of the world size.
+The TP degree must divide both query and KV head counts and the sharded MLP dimensions. Released Nano and Super have 8 KV heads. SiLU and ReLU2 MLP variants have separate plans because ReLU2 has no gate projection.
 
 ### Run it
 
-The full CLI [`examples/cosmos3/inference_cosmos3.py`](https://github.com/huggingface/diffusers/blob/main/examples/cosmos3/inference_cosmos3.py) uses [`Cosmos3OmniModularPipeline`] and reuses these helpers, so **any modality** (text-to-image/video, image-to-video, sound, action modes) runs multi-GPU via `--tp-degree` / `--cp-degree`. Launch with [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html); `--tp-degree * --cp-degree` must equal `--nproc_per_node`. Every rank produces the same output; rank 0 writes it.
+The CLI uses `--parallelism auto` by default: TP-only selects native TP, while CP and combined TP+CP retain the existing example implementation. Launch one process per GPU with `--tp-degree` equal to the world size. All ranks must receive identical prompts, conditioning inputs, and seeds.
 
 ```bash
-# CP only — Nano (fits one GPU); CP degree must divide 32 query heads.
-torchrun --nproc_per_node=4 examples/cosmos3/inference_cosmos3.py --model nano --cp-degree 4 --prompt "..."
-
-# TP only — Super; TP degree must divide 64 query heads and 8 KV heads.
-torchrun --nproc_per_node=4 examples/cosmos3/inference_cosmos3.py --model super --tp-degree 4 --prompt "..."
-
-# TP + CP — Super, with sound (TP=2 x CP=2 across 4 GPUs).
 torchrun --nproc_per_node=4 examples/cosmos3/inference_cosmos3.py \
-    --model super --tp-degree 2 --cp-degree 2 --enable-sound --prompt "..."
+    --model super --tp-degree 4 --prompt "A robot reading a book."
 ```
 
-`Super`'s ~120 GB of weights do not fit on one 96 GB GPU, so it needs TP; `Nano` fits on a single GPU, so CP for it is a pure latency optimization. (Omit both flags to run single-GPU.)
-
-### Fitting large models with tensor parallelism
-
-CP shards *activations* but replicates every weight on every rank, so it does not reduce a model's weight footprint — a model that doesn't fit on one GPU still won't fit under CP alone. To shard the **weights**, `enable_cosmos3_tensor_parallel(transformer, tp_mesh)` applies Megatron-style tensor parallelism on a second, orthogonal mesh axis:
-
-- The attention and MLP projections are column/row sharded across the TP group (`to_q/to_k/to_v` + `add_q/k/v` and the MLPs' `gate/up` are column-parallel; `to_out/to_add_out` and the MLPs' `down` are row-parallel with an all-reduce). Each rank ends up owning `query_heads / tp` query heads and `kv_heads / tp` KV heads.
-- TP composes with CP on a 2-D `(tp, cp)` device mesh: TP splits heads/weights persistently, CP shards the sequence on top. The constraints are `tp` divides the KV heads (8), and `tp * cp` divides the query heads (32 for `Nano`, 64 for `Super`).
-- Weights are loaded to CPU and sharded onto the GPUs layer by layer, so the full model is never materialized on a single device.
-
-> [!TIP]
-> TP issues an all-reduce on every attention and MLP block, so it is bandwidth-heavy. On hosts without NVLink it is the dominant cost; prefer the smallest TP degree that makes the weights fit and put the remaining GPUs into CP.
+`--model-path` selects an existing local checkpoint snapshot. Loading uses native rank-local safetensors slices rather than materializing the full transformer on each GPU. `enable_parallelism(...)` can also shard an already loaded model but incurs the original loading memory cost.
 
 ### Use it in your own modular pipeline
 
-The CLI flags are convenient, but you can call the helpers directly with [`Cosmos3OmniModularPipeline`]. Load the pipeline configuration and components on CPU, apply TP *before* moving the pipeline to the rank-local GPU, switch to the `native` backend, and then enable CP. Do not use `device_map` for this flow:
-
 ```python
 import os
-import sys
 
 import torch
 import torch.distributed as dist
-from diffusers import Cosmos3OmniModularPipeline
-from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
-from torch.distributed.device_mesh import init_device_mesh
+from diffusers import Cosmos3OmniModularPipeline, Cosmos3OmniTransformer
+from diffusers.models._modeling_parallel import TensorParallelConfig
 
-# Make the helper module importable.
-sys.path.insert(0, "examples/cosmos3")
-from cosmos_parallel import (
-    enable_cosmos3_context_parallel,
-    enable_cosmos3_flash_attention,
-    enable_cosmos3_tensor_parallel,
-)
-
-# torchrun sets RANK / WORLD_SIZE / LOCAL_RANK. Pick tp_degree * cp_degree == world size.
 local_rank = int(os.environ["LOCAL_RANK"])
 torch.cuda.set_device(local_rank)
 dist.init_process_group("nccl")
-mesh = init_device_mesh("cuda", (tp_degree, cp_degree), mesh_dim_names=("tp", "cp"))
 
-# Load components on CPU first; a TP-sharded model may not fit one GPU.
+model_id = "nvidia/Cosmos3-Nano"
+transformer = Cosmos3OmniTransformer.from_pretrained(
+    model_id,
+    subfolder="transformer",
+    torch_dtype=torch.bfloat16,
+    parallel_config=TensorParallelConfig(tp_degree=dist.get_world_size()),
+)
 pipe = Cosmos3OmniModularPipeline.from_pretrained(model_id)
-pipe.load_components(dtype=torch.bfloat16)
-pipe.enable_safety_checker()
-
-if tp_degree > 1:
-    enable_cosmos3_tensor_parallel(pipe.transformer, mesh["tp"])  # shard weights -> GPUs
-pipe.to(f"cuda:{local_rank}")                                     # move the replicated remainder
+pipe.update_components(transformer=transformer)
+pipe.load_components(torch_dtype=torch.bfloat16)
+pipe.to(f"cuda:{local_rank}")
 pipe.transformer.set_attention_backend("native")
-if cp_degree > 1:
-    enable_cosmos3_context_parallel(pipe.transformer, mesh["cp"])  # shard the sequence
-elif tp_degree > 1:
-    enable_cosmos3_flash_attention(pipe.transformer)               # GQA-safe dense attention
-
-# Modular pipelines replace components through update_components().
-scheduler = UniPCMultistepScheduler.from_config(
-    pipe.scheduler.config, flow_shift=10.0, use_karras_sigmas=False
+frames = pipe(
+    prompt="A robot reading a book.",
+    num_frames=1,
+    height=512,
+    width=512,
+    generator=torch.Generator().manual_seed(42),
+    output="videos",
 )
-pipe.update_components(scheduler=scheduler)
-
-# A single output name returns that value; a list returns a dictionary.
-outputs = pipe(
-    prompt='{"scene":"A robot arm in a kitchen"}',
-    num_frames=189,
-    height=720,
-    width=1280,
-    output=["videos", "sound", "sampling_rate", "action"],
-)
-videos = outputs["videos"]
-sound = outputs["sound"]  # None unless sound generation was requested.
-action = outputs["action"]  # None unless an action workflow produced actions.
+if dist.get_rank() == 0:
+    frames[0].save("sample.png")
+dist.destroy_process_group()
 ```
 
-For CP only (no weight sharding), use a 1-D mesh: `init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))` and just `enable_cosmos3_context_parallel`.
+Released Super's transformer contains approximately 64.02B BF16 parameters: 128.04 GB (119.25 GiB) of stored tensor data. Other components and runtime memory are additional. This exceeds a 96 GB GPU's capacity, but single-GPU execution can fit on a larger GPU such as GB200, depending on workload. These figures describe released Cosmos 3, not upcoming Cosmos 3.5 MoE models.
 
-`enable_safety_checker()` loads and enables the default checker; `disable_safety_checker()` explicitly disables it. Use those pipeline methods instead of the task-pipeline `enable_safety_checker=` construction argument or `enable_safety_check=` call argument. Modular pipelines also do not return `Cosmos3OmniPipelineOutput`: use `output="videos"` for frames alone, or an output list and its returned dictionary as shown above instead of `result.video`, `result.sound`, or `result.action`.
+Native TP retains the framework's restrictions on quantization, CPU offloading, LoRA, and saving sharded models. Multi-node execution and HSDP/FSDP composition require separate validation.
 
-> [!TIP]
-> On some multi-GPU topologies the first NCCL all-to-all can hang. If a CP run stalls at the start of the first denoising step, set `NCCL_P2P_DISABLE=1` in the environment before launching `torchrun`.
+## Context parallelism
 
-CP and TP compose with all the workflows above (text-to-video, image-to-video, text-to-video with sound, and action-conditioned generation) and with both the `Nano` and `Super` checkpoints — only the pipeline construction and the parallelism setup lines change.
+Context parallelism (CP) remains available through the standalone processors and helpers in [`examples/cosmos3/cosmos_parallel.py`](https://github.com/huggingface/diffusers/blob/main/examples/cosmos3/cosmos_parallel.py). Existing CP and combined TP+CP commands continue to select these helpers automatically. `--parallelism example` selects them explicitly:
+
+```bash
+# Sequence sharding; every rank holds the full model's weights.
+torchrun --nproc_per_node=4 examples/cosmos3/inference_cosmos3.py \
+    --model nano --parallelism example --cp-degree 4 --prompt "A robot reading a book."
+
+# Existing example's orthogonal weight and sequence sharding.
+torchrun --nproc_per_node=4 examples/cosmos3/inference_cosmos3.py \
+    --model super --parallelism example --tp-degree 2 --cp-degree 2 --prompt "A robot reading a book."
+```
+
+The example shards understanding and generation streams and their RoPE separately, pads ragged streams, and handles causal understanding, generation cross-attention, and GQA in its own processor. Its TP degree must divide the KV head count, and `tp_degree * cp_degree` must divide the query head count. Use the `native` attention backend. The helper expands KV heads before calling SDPA so flash kernels can be selected. CP alone does not reduce the weight footprint. Do not apply example helpers to a model already using native TP.
+
+Native Cosmos CP and native TP+CP composition are pending a separate design review. Existing `_cp_plan` hooks and Ulysses Anything collectives can express independent stream sharding and unequal sequence lengths; this does not require a segmented-KV dispatcher API. A Cosmos-specific processor can own causal understanding attention, GQA mapping, and mask ordering. The standard attention API is unchanged by the native TP integration.
 
 ## Metadata templates
 

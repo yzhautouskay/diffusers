@@ -21,6 +21,7 @@ import torch.nn as nn
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import PeftAdapterMixin
 from ...utils import BaseOutput
+from .._modeling_parallel import TensorParallelConfig
 from ..attention import AttentionMixin, AttentionModuleMixin
 from ..attention_dispatch import dispatch_attention_fn
 from ..cache_utils import CacheMixin
@@ -65,12 +66,12 @@ class Cosmos3AttnProcessor:
         rotary_emb: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Per-pathway projections
-        q_und = attn.to_q(und_seq).view(-1, attn.num_attention_heads, attn.head_dim)
-        k_und = attn.to_k(und_seq).view(-1, attn.num_key_value_heads, attn.head_dim)
-        v_und = attn.to_v(und_seq).view(-1, attn.num_key_value_heads, attn.head_dim)
-        q_gen = attn.add_q_proj(gen_seq).view(-1, attn.num_attention_heads, attn.head_dim)
-        k_gen = attn.add_k_proj(gen_seq).view(-1, attn.num_key_value_heads, attn.head_dim)
-        v_gen = attn.add_v_proj(gen_seq).view(-1, attn.num_key_value_heads, attn.head_dim)
+        q_und = attn.to_q(und_seq).unflatten(-1, (-1, attn.head_dim))
+        k_und = attn.to_k(und_seq).unflatten(-1, (-1, attn.head_dim))
+        v_und = attn.to_v(und_seq).unflatten(-1, (-1, attn.head_dim))
+        q_gen = attn.add_q_proj(gen_seq).unflatten(-1, (-1, attn.head_dim))
+        k_gen = attn.add_k_proj(gen_seq).unflatten(-1, (-1, attn.head_dim))
+        v_gen = attn.add_v_proj(gen_seq).unflatten(-1, (-1, attn.head_dim))
 
         q_und = attn.norm_q(q_und)
         k_und = attn.norm_k(k_und)
@@ -380,20 +381,37 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
     # These scale tensors are exported for vLLM-Omni/SGLang and are unused
     # by Diffusers. ModelOpt restores its quantizer state separately.
     _keys_to_ignore_on_load_unexpected = [r"\.(?:input_scale|weight_scale)$"]
+    _tp_plan = {
+        **{
+            f"layers.*.self_attn.{name}": "colwise"
+            for name in ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj")
+        },
+        **{f"layers.*.self_attn.{name}": "rowwise" for name in ("to_out", "to_add_out")},
+        **{f"layers.*.{mlp}.{name}": "colwise" for mlp in ("mlp", "mlp_moe_gen") for name in ("gate_proj", "up_proj")},
+        **{f"layers.*.{mlp}.down_proj": "rowwise" for mlp in ("mlp", "mlp_moe_gen")},
+    }
     # Optional context-parallelism seams. They default to ``None`` (no-op) so the
     # model itself carries no CP logic. `forward` applies `_cp_shard_fn` to the
     # per-pathway hidden states + rotary embeddings before the decoder layers, and
     # `_cp_gather_fn` to the per-pathway outputs after the final norm. An external
     # helper (see `examples/cosmos3/cosmos_parallel.py`) sets these to
     # shard/gather across a device mesh and installs a context-parallel attention
-    # processor — the packed dual-pathway + GQA + ragged-length structure cannot be
-    # expressed as diffusers' declarative `_cp_plan`, so CP lives outside the model.
+    # processor. Native CP integration requires a separate processor design review;
+    # these compatibility seams retain the existing example implementation.
     _cp_shard_fn = None
     _cp_gather_fn = None
     # `dtype` is injected into init_dict by ModelMixin.from_pretrained (configuration_utils.py:289),
     # so __init__ must accept it. Excluding it here keeps save_pretrained from writing it into
     # config.json — the value is a load-time runtime hint, not part of the model architecture.
     ignore_for_config = ["dtype"]
+
+    def _resolve_parallel_config(self, config):
+        tp = config if isinstance(config, TensorParallelConfig) else getattr(config, "tensor_parallel_config", None)
+        if tp is not None:
+            degree = tp.mesh.size() if tp.mesh is not None else tp.tp_degree
+            if self.config.num_attention_heads % degree or self.config.num_key_value_heads % degree:
+                raise ValueError("Cosmos3 TP degree must divide both query and KV head counts.")
+        return super()._resolve_parallel_config(config)
 
     @register_to_config
     def __init__(
@@ -441,6 +459,8 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
         # Text-model layers live directly on the transformer (flat layout). The published
         # checkpoint must be re-keyed with the leading `model.` prefix stripped — see
         # scripts/build_flat_layout_repo.py for the rewrite.
+        if hidden_act == "relu2":
+            self._tp_plan = {name: style for name, style in self._tp_plan.items() if not name.endswith("gate_proj")}
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
         self.layers = nn.ModuleList(
             [

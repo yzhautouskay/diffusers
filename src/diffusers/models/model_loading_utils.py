@@ -453,7 +453,9 @@ def _load_shard_file_tp(
                     param = param.to(dtype)
 
             if spec is None:
-                set_module_tensor_to_device(model, key, device, value=param)
+                # Accelerate otherwise casts back to the meta parameter's construction
+                # dtype, undoing keep_in_fp32_modules for replicated parameters.
+                set_module_tensor_to_device(model, key, device, value=param, dtype=param.dtype)
                 continue
 
             path, _, param_name = key.rpartition(".")

@@ -27,16 +27,16 @@ Text-to-video-with-sound (requires a sound-capable checkpoint):
 Multi-GPU (any modality above): launch with torchrun and pass parallelism degrees.
 ``--tp-degree`` shards the weights (so large checkpoints fit), ``--cp-degree`` shards
 the sequence (Ulysses, lower latency); ``--nproc_per_node`` must equal their product.
-These reuse the helpers in ``cosmos_parallel.py``.
+Native Diffusers TP is selected automatically for TP-only execution. CP and TP+CP
+retain the existing helpers in ``cosmos_parallel.py`` unless explicitly overridden.
     # TP=2 x CP=2 across 4 GPUs (Super):
-    torchrun --nproc_per_node 4 inference_cosmos3.py --model super --tp-degree 2 --cp-degree 2 --prompt "..."
+    torchrun --nproc_per_node 4 inference_cosmos3.py --model super --parallelism example --tp-degree 2 --cp-degree 2 --prompt "..."
 """
 
 import argparse
 import json
 import os
 import pathlib
-import sys
 import urllib.request
 
 import torch
@@ -44,15 +44,6 @@ from huggingface_hub import snapshot_download
 
 from diffusers import Cosmos3OmniModularPipeline, CosmosActionCondition, UniPCMultistepScheduler
 from diffusers.utils import encode_video, export_to_video, load_image, load_video
-
-
-# Multi-GPU helpers (context + tensor parallelism) live in the sibling module.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cosmos_parallel import (  # noqa: E402
-    enable_cosmos3_context_parallel,
-    enable_cosmos3_flash_attention,
-    enable_cosmos3_tensor_parallel,
-)
 
 
 HF_REPOS = {
@@ -80,6 +71,8 @@ def _load_action(path: str | None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--prompt", required=True, help="Text prompt.")
+    parser.add_argument("--parallelism", choices=["auto", "native", "example"], default="auto")
+    parser.add_argument("--model-path", default=None, help="Use an existing local checkpoint snapshot.")
     parser.add_argument(
         "--model",
         choices=sorted(HF_REPOS),
@@ -215,6 +208,11 @@ def main():
     args = parser.parse_args()
 
     tp, cp = args.tp_degree, args.cp_degree
+    if args.parallelism == "auto":
+        args.parallelism = "example" if cp > 1 else "native"
+    if args.parallelism == "native" and cp > 1:
+        parser.error("Native CP is pending processor design review. Use --parallelism example for CP or TP+CP.")
+
     distributed = tp * cp > 1
 
     if distributed:
@@ -242,11 +240,20 @@ def main():
 
     hf_repo = HF_REPOS[args.model]
     log(f"Downloading pipeline from {hf_repo}")
-    pipeline_path = pathlib.Path(snapshot_download(repo_id=hf_repo))
+    pipeline_path = pathlib.Path(args.model_path or snapshot_download(repo_id=hf_repo))
     log(f"Loading pipeline from {pipeline_path} …")
 
     # Components load lazily on CPU so a TP-sharded model never needs to fit on one GPU.
     pipeline = Cosmos3OmniModularPipeline.from_pretrained(str(pipeline_path))
+    if distributed and args.parallelism == "native":
+        from diffusers import Cosmos3OmniTransformer
+        from diffusers.models._modeling_parallel import TensorParallelConfig
+
+        config = TensorParallelConfig(tp_degree=tp)
+        transformer = Cosmos3OmniTransformer.from_pretrained(
+            pipeline_path, subfolder="transformer", torch_dtype=torch.bfloat16, parallel_config=config
+        )
+        pipeline.update_components(transformer=transformer)
     pipeline.load_components(torch_dtype=torch.bfloat16)
     if args.disable_safety_checker:
         pipeline.disable_safety_checker()
@@ -255,7 +262,17 @@ def main():
         if args.no_safety_check:
             pipeline.disable_safety_checker()
 
-    if distributed:
+    if distributed and args.parallelism == "native":
+        pipeline.to(dev)
+        pipeline.transformer.set_attention_backend("native")
+        log(f"Native parallelism: TP={tp} x CP={cp} over {world} GPUs.")
+    elif distributed:
+        from cosmos_parallel import (
+            enable_cosmos3_context_parallel,
+            enable_cosmos3_flash_attention,
+            enable_cosmos3_tensor_parallel,
+        )
+
         qh = pipeline.transformer.config.num_attention_heads
         kv = pipeline.transformer.config.num_key_value_heads
         if kv % tp != 0:
