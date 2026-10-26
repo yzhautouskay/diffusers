@@ -32,3 +32,23 @@ transformer = Cosmos3OmniTransformer.from_pretrained(
 ## Cosmos3OmniTransformer
 
 [[autodoc]] Cosmos3OmniTransformer
+
+## Native context parallelism
+
+Initialize `torch.distributed`, select the local CUDA device, and pass a native configuration:
+
+```python
+from diffusers import ContextParallelConfig
+
+transformer.enable_parallelism(config=ContextParallelConfig(ulysses_degree=4))
+with torch.inference_mode():
+    output = transformer(**inputs)
+```
+
+`from_pretrained(..., parallel_config=ContextParallelConfig(ulysses_degree=4))` is also supported; move the CP-only model to the local CUDA device after loading. CP replicates weights and partitions both token streams. The degree must divide the query head count. This inference implementation supports Ulysses with the `native` attention backend; ring attention and training are not supported.
+
+The model installs a standalone `Cosmos3UlyssesAttnProcessor`. Its `_cp_plan` splits hidden states at the first layer, splits each layer's RoPE, and gathers final normalized outputs. Each stream is padded to equal rank lengths, including empty streams; padding is removed before attention and after the final gather. Causal understanding retains global token order. Generation attends to understanding followed by generation keys.
+
+The processor packs each stream's Q/K/V into an existing Ulysses collective and reverses the output exchange. Compact GQA heads are retained wherever possible; KV groups are replicated only as needed for CP head ownership. No segmented input type or new shared attention dispatcher argument is introduced. The standard single-GPU/TP processor remains unaware of CP. SeaCache retains its existing request/CFG state and synchronizes compute decisions for native CP.
+
+Understanding prefill is deliberately not part of this integration. Causal understanding can be reused when conditioning is fixed, but transparent reuse requires a request-scoped cache for every CFG branch and layer. Compact BF16 KV costs `2 * layers * understanding_tokens * KV_heads * head_dim * 2` bytes before TP partitioning. Long video conditioning can therefore retain gigabytes per branch. This implementation shards understanding computation alongside generation, adds no persistent KV cache, and recomputes changed conditioning on every forward.

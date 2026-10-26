@@ -11,16 +11,14 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from diffusers import Cosmos3OmniTransformer
-from diffusers.models._modeling_parallel import TensorParallelConfig
+from diffusers import Cosmos3OmniTransformer, SeaCacheConfig
+from diffusers.models._modeling_parallel import ContextParallelConfig, TensorParallelConfig
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--tp", type=int, default=1)
 parser.add_argument("--cp", type=int, default=1)
 args = parser.parse_args()
-if args.cp != 1:
-    parser.error("Native CP is experimental and excluded from this TP worker.")
 torch.set_float32_matmul_precision("highest")
 torch.backends.cuda.matmul.allow_tf32 = False
 rank = int(os.environ["RANK"])
@@ -30,7 +28,8 @@ device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 
 
 def parallel():
-    return TensorParallelConfig(tp_degree=args.tp)
+    return ContextParallelConfig(ulysses_degree=args.cp) if args.cp > 1 else TensorParallelConfig(tp_degree=args.tp)
+
 
 def inputs(u, g, dtype):
     idx = torch.arange(u, u + g, device=device)
@@ -71,6 +70,7 @@ def check(actual, expected, label, dtype):
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "examples/cosmos3"))
 from cosmos_parallel import (  # noqa: E402
+    enable_cosmos3_context_parallel,
     enable_cosmos3_flash_attention,
     enable_cosmos3_tensor_parallel,
 )
@@ -116,7 +116,10 @@ with torch.no_grad(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBacke
                 config = model._parallel_config
                 if args.tp > 1:
                     enable_cosmos3_tensor_parallel(legacy, config.tensor_parallel_config._mesh)
-                enable_cosmos3_flash_attention(legacy)
+                if args.cp > 1:
+                    enable_cosmos3_context_parallel(legacy, config.context_parallel_config._ulysses_mesh)
+                else:
+                    enable_cosmos3_flash_attention(legacy)
                 # Example uses flash-attn; set backend native on installed processors for portable comparison.
                 for proc in legacy.attn_processors.values():
                     proc._attention_backend = "native"
@@ -168,6 +171,33 @@ with torch.no_grad(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBacke
                     print("BUFFER DIFFERENCE", name, buf, other, flush=True)
             check(loaded(**data).sample[0], model(**data).sample[0], f"load_vs_enable_{act}", dtype)
             check(loaded(**data).sample[0], ref(**data).sample[0], f"checkpoint_{act}", dtype)
+            # Repeated requests and independent CFG contexts exercise native CP cache gates.
+            if args.cp > 1 and dtype == torch.float32:
+                loaded.enable_cache(SeaCacheConfig(threshold=100.0, cache_end_steps=0))
+                ref.enable_cache(SeaCacheConfig(threshold=100.0, cache_end_steps=0))
+                decisions = []
+                for request in range(2):
+                    loaded._reset_stateful_cache()
+                    ref._reset_stateful_cache()
+                    data = inputs(5 + request, 7, dtype)
+                    for step in range(4):
+                        for branch in ("cond", "uncond"):
+                            data["input_ids"] = (
+                                torch.arange(5 + request, device=device) + request + (branch == "uncond")
+                            ) % 32
+                            runtime = {"step_index": step, "sigma": 0.9 - step * 0.1, "num_inference_steps": 4}
+                            with loaded.cache_context(branch, **runtime), ref.cache_context(branch, **runtime):
+                                check(
+                                    loaded(**data).sample[0],
+                                    ref(**data).sample[0],
+                                    f"sea_{act}_{request}_{step}_{branch}",
+                                    dtype,
+                                )
+                            state = loaded._diffusers_hook.get_hook("sea_cache_root").state_manager._state_cache[
+                                branch
+                            ]
+                            decisions.append(state.gate_should_compute)
+                assert any(decisions) and not all(decisions)
             del loaded, ref, model
             torch.cuda.empty_cache()
 if rank == 0:

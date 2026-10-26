@@ -21,9 +21,14 @@ import torch.nn as nn
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import PeftAdapterMixin
 from ...utils import BaseOutput
-from .._modeling_parallel import TensorParallelConfig
+from .._modeling_parallel import (
+    ContextParallelConfig,
+    ContextParallelInput,
+    ContextParallelOutput,
+    TensorParallelConfig,
+)
 from ..attention import AttentionMixin, AttentionModuleMixin
-from ..attention_dispatch import dispatch_attention_fn
+from ..attention_dispatch import SeqAllToAllDim, dispatch_attention_fn
 from ..cache_utils import CacheMixin
 from ..embeddings import TimestepEmbedding, Timesteps
 from ..modeling_utils import ModelMixin
@@ -121,6 +126,129 @@ class Cosmos3AttnProcessor:
         und_out = attn.to_out(causal_out)
         gen_out = attn.to_add_out(full_out)
         return und_out, gen_out
+
+
+def _cosmos3_exchange_qkv(group, query, key, value, extra_key=None):
+    """Exchange one stream through the existing Ulysses collective, packing by destination head group."""
+    degree = torch.distributed.get_world_size(group)
+    query_heads, kv_heads = query.shape[1], key.shape[1]
+    # Replicate only KV groups split by CP, not every query head. This also covers
+    # non-nested divisors, e.g. Q=12, KV=3, CP=4.
+    repeats = math.lcm(kv_heads, degree) // kv_heads
+    kv = [key, value] if extra_key is None else [key, value, extra_key]
+    if repeats > 1:
+        kv = [tensor.repeat_interleave(repeats, dim=1) for tensor in kv]
+    packed = torch.cat([tensor.unflatten(1, (degree, -1)) for tensor in (query, *kv)], dim=2)
+    packed = packed.flatten(1, 2).unsqueeze(0)
+    exchanged = SeqAllToAllDim.apply(group, packed, 2, 1)
+    sizes = [query_heads // degree] + [kv_heads * repeats // degree] * len(kv)
+    return exchanged.split(sizes, dim=2)
+
+
+def _cosmos3_ulysses_attention(
+    group, q_und, k_und, v_und, q_gen, k_gen, v_gen, sequence_lengths, k_und_for_gen=None, gen_attention_mask=None
+):
+    """Cosmos stream semantics around native collectives; the shared attention API remains tensor-only."""
+    und_length, gen_length = sequence_lengths
+    und = _cosmos3_exchange_qkv(group, q_und, k_und, v_und, k_und_for_gen)
+    q_und, k_und, v_und = und[:3]
+    k_und_for_gen = und[3] if len(und) == 4 else k_und
+    q_gen, k_gen, v_gen = _cosmos3_exchange_qkv(group, q_gen, k_gen, v_gen)
+    und_padded, gen_padded = q_und.shape[1], q_gen.shape[1]
+    # Remove each stream's padding BEFORE attention. This preserves causal order,
+    # avoids exposing padded keys, and keeps the unmasked production fused kernel.
+    if und_length:
+        und_out = dispatch_attention_fn(
+            q_und[:, :und_length],
+            k_und[:, :und_length],
+            v_und[:, :und_length],
+            is_causal=True,
+            enable_gqa=q_und.shape[2] != k_und.shape[2],
+            backend="native",
+        )
+    else:
+        und_out = q_und[:, :0]
+    if gen_length:
+        if gen_attention_mask is not None:
+            if gen_attention_mask.shape[-1] != und_length + gen_length or gen_attention_mask.shape[-2] not in (
+                1,
+                gen_length,
+            ):
+                raise ValueError(
+                    "Cosmos CP expects a global generation mask in [understanding, generation] key order."
+                )
+            if gen_attention_mask.ndim != 4 or gen_attention_mask.shape[1] != 1:
+                raise ValueError("Cosmos CP generation masks must broadcast across attention heads.")
+        gen_out = dispatch_attention_fn(
+            q_gen[:, :gen_length],
+            torch.cat([k_und_for_gen[:, :und_length], k_gen[:, :gen_length]], dim=1),
+            torch.cat([v_und[:, :und_length], v_gen[:, :gen_length]], dim=1),
+            attn_mask=gen_attention_mask,
+            enable_gqa=q_gen.shape[2] != k_gen.shape[2],
+            backend="native",
+        )
+    else:
+        gen_out = q_gen[:, :0]
+    und_out = torch.nn.functional.pad(und_out, (0, 0, 0, 0, 0, und_padded - und_length))
+    gen_out = torch.nn.functional.pad(gen_out, (0, 0, 0, 0, 0, gen_padded - gen_length))
+    und_out = SeqAllToAllDim.apply(group, und_out, 1, 2).squeeze(0).flatten(-2, -1)
+    gen_out = SeqAllToAllDim.apply(group, gen_out, 1, 2).squeeze(0).flatten(-2, -1)
+    return und_out, gen_out
+
+
+class Cosmos3UlyssesAttnProcessor:
+    """Standalone inference processor using native Ulysses communication and compact GQA KV heads."""
+
+    _attention_backend = "native"
+    _parallel_config = None
+    _sequence_lengths = None
+
+    def __call__(self, attn, und_seq, gen_seq, rotary_emb):
+        if torch.is_grad_enabled():
+            raise RuntimeError("Cosmos3 native context parallelism currently supports inference only.")
+        if self._attention_backend not in (None, "native"):
+            raise ValueError("Cosmos3 native context parallelism requires the native attention backend.")
+        # Per-pathway projections
+        q_und = attn.to_q(und_seq).unflatten(-1, (-1, attn.head_dim))
+        k_und = attn.to_k(und_seq).unflatten(-1, (-1, attn.head_dim))
+        v_und = attn.to_v(und_seq).unflatten(-1, (-1, attn.head_dim))
+        q_gen = attn.add_q_proj(gen_seq).unflatten(-1, (-1, attn.head_dim))
+        k_gen = attn.add_k_proj(gen_seq).unflatten(-1, (-1, attn.head_dim))
+        v_gen = attn.add_v_proj(gen_seq).unflatten(-1, (-1, attn.head_dim))
+
+        q_und = attn.norm_q(q_und)
+        k_und = attn.norm_k(k_und)
+        k_und_for_gen = attn.k_norm_und_for_gen(k_und) if attn.k_norm_und_for_gen is not None else k_und
+        q_gen = attn.norm_added_q(q_gen)
+        k_gen = attn.norm_added_k(k_gen)
+
+        # Apply rotary position embeddings per pathway
+        cos_und, sin_und, cos_gen, sin_gen = rotary_emb
+        cos_und = cos_und.unsqueeze(1)
+        sin_und = sin_und.unsqueeze(1)
+        q_und = q_und * cos_und + _rotate_half(q_und) * sin_und
+        k_und = k_und * cos_und + _rotate_half(k_und) * sin_und
+        k_und_for_gen = k_und_for_gen * cos_und + _rotate_half(k_und_for_gen) * sin_und
+        cos_gen = cos_gen.unsqueeze(1)
+        sin_gen = sin_gen.unsqueeze(1)
+        q_gen = q_gen * cos_gen + _rotate_half(q_gen) * sin_gen
+        k_gen = k_gen * cos_gen + _rotate_half(k_gen) * sin_gen
+
+        # The standard processor remains unaware of CP. Keep its projection/norm/
+        # RoPE semantics here, including the separate understanding-key norm.
+        extra_key = k_und_for_gen if attn.k_norm_und_for_gen is not None else None
+        causal_out, full_out = _cosmos3_ulysses_attention(
+            self._parallel_config.context_parallel_config._ulysses_mesh.get_group(),
+            q_und,
+            k_und,
+            v_und,
+            q_gen,
+            k_gen,
+            v_gen,
+            self._sequence_lengths,
+            extra_key,
+        )
+        return attn.to_out(causal_out), attn.to_add_out(full_out)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -390,14 +518,25 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
         **{f"layers.*.{mlp}.{name}": "colwise" for mlp in ("mlp", "mlp_moe_gen") for name in ("gate_proj", "up_proj")},
         **{f"layers.*.{mlp}.down_proj": "rowwise" for mlp in ("mlp", "mlp_moe_gen")},
     }
+    _cp_plan = {
+        "layers.0": {
+            "und_seq": ContextParallelInput(split_dim=0, expected_dims=2),
+            "gen_seq": ContextParallelInput(split_dim=0, expected_dims=2),
+        },
+        "layers.*": {
+            "rotary_emb": [ContextParallelInput(split_dim=0, expected_dims=2) for _ in range(4)],
+        },
+        "norm": ContextParallelOutput(gather_dim=0, expected_dims=2),
+        "norm_moe_gen": ContextParallelOutput(gather_dim=0, expected_dims=2),
+    }
     # Optional context-parallelism seams. They default to ``None`` (no-op) so the
     # model itself carries no CP logic. `forward` applies `_cp_shard_fn` to the
     # per-pathway hidden states + rotary embeddings before the decoder layers, and
     # `_cp_gather_fn` to the per-pathway outputs after the final norm. An external
     # helper (see `examples/cosmos3/cosmos_parallel.py`) sets these to
     # shard/gather across a device mesh and installs a context-parallel attention
-    # processor. Native CP integration requires a separate processor design review;
-    # these compatibility seams retain the existing example implementation.
+    # processor. Native CP uses the declarative plan and its own processor; these
+    # compatibility seams retain the existing example implementation.
     _cp_shard_fn = None
     _cp_gather_fn = None
     # `dtype` is injected into init_dict by ModelMixin.from_pretrained (configuration_utils.py:289),
@@ -407,11 +546,26 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
 
     def _resolve_parallel_config(self, config):
         tp = config if isinstance(config, TensorParallelConfig) else getattr(config, "tensor_parallel_config", None)
-        if tp is not None:
-            degree = tp.mesh.size() if tp.mesh is not None else tp.tp_degree
-            if self.config.num_attention_heads % degree or self.config.num_key_value_heads % degree:
-                raise ValueError("Cosmos3 TP degree must divide both query and KV head counts.")
-        return super()._resolve_parallel_config(config)
+        cp = config if isinstance(config, ContextParallelConfig) else getattr(config, "context_parallel_config", None)
+        degree = tp.mesh.size() if tp is not None and tp.mesh is not None else tp.tp_degree if tp is not None else 1
+        if self.config.num_attention_heads % degree or self.config.num_key_value_heads % degree:
+            raise ValueError("Cosmos3 TP degree must divide both query and KV head counts.")
+        if cp is not None:
+            if cp.ring_degree != 1 or cp.ring_anything:
+                raise ValueError("Cosmos3 native CP supports Ulysses only (ring_degree=1).")
+            if self.config.num_attention_heads // degree % cp.ulysses_degree:
+                raise ValueError("Cosmos3 CP degree must divide the TP-local query head count.")
+            if self._cp_shard_fn is not None or self._cp_gather_fn is not None:
+                raise ValueError("Native Cosmos3 CP cannot be combined with the example CP helper.")
+            for proc in self.attn_processors.values():
+                if not isinstance(proc, (Cosmos3AttnProcessor, Cosmos3UlyssesAttnProcessor)):
+                    raise ValueError("Native Cosmos3 CP cannot replace a custom attention processor.")
+                if proc._attention_backend not in (None, "native"):
+                    raise ValueError("Cosmos3 native CP requires the native attention backend.")
+        resolved = super()._resolve_parallel_config(config)
+        if cp is not None:
+            self.set_attn_processor({name: Cosmos3UlyssesAttnProcessor() for name in self.attn_processors})
+        return resolved
 
     @register_to_config
     def __init__(
@@ -676,6 +830,22 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
         gen_seq: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        cp = self._parallel_config.context_parallel_config if self._parallel_config is not None else None
+        if cp is not None:
+            und_length, gen_length = und_seq.shape[0], gen_seq.shape[0]
+            degree = cp.ulysses_degree
+
+            # Bound padding to fewer than CP tokens per nonempty stream. Empty
+            # streams get one dummy token per rank so all collectives stay uniform.
+            def pad(tensor):
+                padded = max(degree, math.ceil(tensor.shape[0] / degree) * degree)
+                return torch.nn.functional.pad(tensor, (0, 0, 0, padded - tensor.shape[0]))
+
+            und_seq, gen_seq = pad(und_seq), pad(gen_seq)
+            rotary_emb = tuple(pad(tensor) for tensor in rotary_emb)
+            for layer in self.layers:
+                layer.self_attn.processor._sequence_lengths = (und_length, gen_length)
+
         for decoder_layer in self.layers:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 und_seq, gen_seq = self._gradient_checkpointing_func(
@@ -684,7 +854,10 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
             else:
                 und_seq, gen_seq = decoder_layer(und_seq, gen_seq, rotary_emb)
 
-        return self.norm(und_seq), self.norm_moe_gen(gen_seq)
+        und_seq, gen_seq = self.norm(und_seq), self.norm_moe_gen(gen_seq)
+        if cp is not None:
+            return und_seq[:und_length], gen_seq[:gen_length]
+        return und_seq, gen_seq
 
     # -------------------------------------------------------------------------
     # forward: full per-step pass — encode text/vision/sound/action → run layers →

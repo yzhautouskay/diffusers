@@ -612,7 +612,10 @@ class SeaCacheRootHook(ModelHook):
         """Resolve the Cosmos 3 gate eagerly before entering compiled decoder blocks."""
         unwrapped_module = unwrap_module(module)
         layers = getattr(unwrapped_module, "layers", None)
-        uses_context_parallel = getattr(unwrapped_module, "_cp_shard_fn", None) is not None
+        parallel_config = getattr(unwrapped_module, "_parallel_config", None)
+        uses_context_parallel = getattr(unwrapped_module, "_cp_shard_fn", None) is not None or (
+            parallel_config is not None and parallel_config.context_parallel_config is not None
+        )
         has_fsdp, has_dtensor = _parameter_sharding_types(layers) if layers else (False, False)
         uses_supported_parallelism = uses_context_parallel or has_dtensor
         synchronize_decision = (

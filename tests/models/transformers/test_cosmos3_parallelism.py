@@ -89,3 +89,21 @@ def test_tp_loader_preserves_replicated_fp32_parameters(tmp_path):
     for name, parameter in model.named_parameters():
         assert parameter.dtype == torch.float32
         torch.testing.assert_close(parameter, weights[name], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("degree,ring,message", [(3, 1, "TP-local query"), (2, 2, "Ulysses only")])
+def test_cosmos_rejects_unsupported_cp_before_setup(degree, ring, message):
+    from diffusers.models._modeling_parallel import ContextParallelConfig
+
+    model = Cosmos3OmniTransformer(
+        hidden_size=32,
+        intermediate_size=64,
+        head_dim=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=1,
+        vocab_size=16,
+    )
+    with pytest.raises(ValueError, match=message):
+        model._resolve_parallel_config(ContextParallelConfig(ulysses_degree=degree, ring_degree=ring))
+    assert model._parallel_config is None
