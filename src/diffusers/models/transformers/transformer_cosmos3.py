@@ -189,8 +189,10 @@ def _cosmos3_ulysses_attention(
         )
     else:
         gen_out = q_gen[:, :0]
-    und_out = torch.nn.functional.pad(und_out, (0, 0, 0, 0, 0, und_padded - und_length))
-    gen_out = torch.nn.functional.pad(gen_out, (0, 0, 0, 0, 0, gen_padded - gen_length))
+    if und_padded != und_length:
+        und_out = torch.nn.functional.pad(und_out, (0, 0, 0, 0, 0, und_padded - und_length))
+    if gen_padded != gen_length:
+        gen_out = torch.nn.functional.pad(gen_out, (0, 0, 0, 0, 0, gen_padded - gen_length))
     und_out = SeqAllToAllDim.apply(group, und_out, 1, 2).squeeze(0).flatten(-2, -1)
     gen_out = SeqAllToAllDim.apply(group, gen_out, 1, 2).squeeze(0).flatten(-2, -1)
     return und_out, gen_out
@@ -530,8 +532,8 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
         "norm": ContextParallelOutput(gather_dim=0, expected_dims=2),
         "norm_moe_gen": ContextParallelOutput(gather_dim=0, expected_dims=2),
     }
-    # Optional context-parallelism seams. They default to ``None`` (no-op) so the
-    # model itself carries no CP logic. `forward` applies `_cp_shard_fn` to the
+    # Compatibility seams for the external example. They default to ``None``.
+    # `forward` applies `_cp_shard_fn` to the
     # per-pathway hidden states + rotary embeddings before the decoder layers, and
     # `_cp_gather_fn` to the per-pathway outputs after the final norm. An external
     # helper (see `examples/cosmos3/cosmos_parallel.py`) sets these to
@@ -840,6 +842,8 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
             # streams get one dummy token per rank so all collectives stay uniform.
             def pad(tensor):
                 padded = max(degree, math.ceil(tensor.shape[0] / degree) * degree)
+                if padded == tensor.shape[0]:
+                    return tensor
                 return torch.nn.functional.pad(tensor, (0, 0, 0, padded - tensor.shape[0]))
 
             und_seq, gen_seq = pad(und_seq), pad(gen_seq)
