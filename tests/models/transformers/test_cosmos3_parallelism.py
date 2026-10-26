@@ -107,3 +107,26 @@ def test_cosmos_rejects_unsupported_cp_before_setup(degree, ring, message):
     with pytest.raises(ValueError, match=message):
         model._resolve_parallel_config(ContextParallelConfig(ulysses_degree=degree, ring_degree=ring))
     assert model._parallel_config is None
+
+
+def test_combined_parallelism_requires_model_opt_in(monkeypatch):
+    from types import SimpleNamespace
+
+    from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelConfig
+    from diffusers.models.modeling_utils import ModelMixin
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    monkeypatch.setattr(torch._C, "_get_accelerator", lambda: SimpleNamespace(type="cuda"))
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 4)
+    model = ModelMixin()
+    config = ParallelConfig(ContextParallelConfig(ulysses_degree=2), TensorParallelConfig(tp_degree=2))
+    with pytest.raises(ValueError, match="does not support combined"):
+        model._resolve_parallel_config(config)
+    assert model._parallel_config is None
+    model._supports_tp_cp_composition = True
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 3)
+    with pytest.raises(ValueError, match="multiply to"):
+        model._resolve_parallel_config(config)
+    assert model._parallel_config is None

@@ -217,10 +217,8 @@ class ParallelConfig:
 
     def __post_init__(self):
         if self.context_parallel_config is not None and self.tensor_parallel_config is not None:
-            raise ValueError(
-                "Combining context parallelism and tensor parallelism in a single `ParallelConfig` is not supported. "
-                "Please specify only one of `context_parallel_config` or `tensor_parallel_config`."
-            )
+            if self.context_parallel_config.mesh is not None or self.tensor_parallel_config.mesh is not None:
+                raise ValueError("Combined TP+CP currently requires automatically constructed orthogonal meshes.")
 
     def setup(
         self,
@@ -235,9 +233,13 @@ class ParallelConfig:
         self._device = device
         self._mesh = mesh
         if self.context_parallel_config is not None:
-            self.context_parallel_config.setup(rank, world_size, device, mesh)
+            self.context_parallel_config.setup(
+                rank, world_size, device, mesh["ring", "ulysses"] if self.tensor_parallel_config is not None else mesh
+            )
         if self.tensor_parallel_config is not None:
-            self.tensor_parallel_config.setup(rank, world_size, device, mesh)
+            self.tensor_parallel_config.setup(
+                rank, world_size, device, mesh["tp"] if self.context_parallel_config is not None else mesh
+            )
 
 
 @dataclass(frozen=True)

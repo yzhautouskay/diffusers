@@ -260,6 +260,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
     _supports_group_offloading = True
     _repeated_blocks = []
     _parallel_config = None
+    _supports_tp_cp_composition = False
     _cp_plan = None
     _tp_plan = None
     _skip_keys = None
@@ -1547,6 +1548,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 from ..hooks.tensor_parallel import apply_tensor_parallel
 
                 apply_tensor_parallel(model, tp_config, model._tp_plan, weights_already_sharded=True)
+                model._apply_context_parallel(parallel_config)
             else:
                 model.enable_parallelism(config=parallel_config)
 
@@ -1719,7 +1721,18 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         device = torch.device(device_type, rank % torch.accelerator.device_count())
 
         mesh = None
-        if config.context_parallel_config is not None:
+        if config.context_parallel_config is not None and config.tensor_parallel_config is not None:
+            if not self._supports_tp_cp_composition:
+                raise ValueError(f"{self.__class__.__name__} does not support combined TP+CP.")
+            cp_config, tp_config = config.context_parallel_config, config.tensor_parallel_config
+            if cp_config.ring_degree * cp_config.ulysses_degree * tp_config.tp_degree != world_size:
+                raise ValueError("Combined TP+CP degrees must multiply to the distributed world size.")
+            mesh = torch.distributed.device_mesh.init_device_mesh(
+                device_type=device_type,
+                mesh_shape=(*cp_config.mesh_shape, tp_config.tp_degree),
+                mesh_dim_names=(*cp_config.mesh_dim_names, "tp"),
+            )
+        elif config.context_parallel_config is not None:
             cp_config = config.context_parallel_config
             mesh = cp_config.mesh or torch.distributed.device_mesh.init_device_mesh(
                 device_type=device_type,
@@ -1749,11 +1762,6 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             "`enable_parallelism` is an experimental feature. The API may change in the future and breaking changes may be introduced at any time without warning."
         )
 
-        from ..hooks.context_parallel import apply_context_parallel
-        from .attention import AttentionModuleMixin
-        from .attention_dispatch import AttentionBackendName, _AttentionBackendRegistry
-        from .attention_processor import Attention, MochiAttention
-
         if self._parallel_config is not None:
             raise RuntimeError(
                 f"Parallelism is already applied to this {self.__class__.__name__}. `enable_parallelism` cannot be "
@@ -1779,6 +1787,20 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             resolve_tp_shard_specs(self, self._tp_plan, _tp_degree(tp_config))
 
         config = self._resolve_parallel_config(config)
+
+        self._apply_context_parallel(config, cp_plan)
+
+        if config.tensor_parallel_config is not None:
+            from ..hooks.tensor_parallel import apply_tensor_parallel
+
+            apply_tensor_parallel(self, config.tensor_parallel_config, self._tp_plan)
+
+    def _apply_context_parallel(self, config: ParallelConfig, cp_plan=None):
+        """Install CP processor configuration and hooks, also after TP-aware checkpoint loading."""
+        from ..hooks.context_parallel import apply_context_parallel
+        from .attention import AttentionModuleMixin
+        from .attention_dispatch import AttentionBackendName, _AttentionBackendRegistry
+        from .attention_processor import Attention, MochiAttention
 
         attention_classes = (Attention, MochiAttention, AttentionModuleMixin)
 
@@ -1828,11 +1850,6 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 )
             cp_plan = cp_plan if cp_plan is not None else self._cp_plan
             apply_context_parallel(self, config.context_parallel_config, cp_plan)
-
-        if config.tensor_parallel_config is not None:
-            from ..hooks.tensor_parallel import apply_tensor_parallel
-
-            apply_tensor_parallel(self, config.tensor_parallel_config, self._tp_plan)
 
     @classmethod
     def _load_pretrained_model(
