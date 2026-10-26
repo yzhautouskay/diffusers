@@ -52,3 +52,20 @@ The model installs a standalone `Cosmos3UlyssesAttnProcessor`. Its `_cp_plan` sp
 The processor packs each stream's Q/K/V into an existing Ulysses collective and reverses the output exchange. Compact GQA heads are retained wherever possible; KV groups are replicated only as needed for CP head ownership. No segmented input type or new shared attention dispatcher argument is introduced. The standard single-GPU/TP processor remains unaware of CP. SeaCache retains its existing request/CFG state and synchronizes compute decisions for native CP.
 
 Understanding prefill is deliberately not part of this integration. Causal understanding can be reused when conditioning is fixed, but transparent reuse requires a request-scoped cache for every CFG branch and layer. Compact BF16 KV costs `2 * layers * understanding_tokens * KV_heads * head_dim * 2` bytes before TP partitioning. Long video conditioning can therefore retain gigabytes per branch. This implementation shards understanding computation alongside generation, adds no persistent KV cache, and recomputes changed conditioning on every forward.
+
+## Combining tensor and context parallelism
+
+```python
+from diffusers import ParallelConfig, TensorParallelConfig
+
+config = ParallelConfig(
+    tensor_parallel_config=TensorParallelConfig(tp_degree=2),
+    context_parallel_config=ContextParallelConfig(ulysses_degree=2),
+)
+transformer = Cosmos3OmniTransformer.from_pretrained(
+    "nvidia/Cosmos3-Nano", subfolder="transformer", torch_dtype=torch.bfloat16,
+    parallel_config=config,
+)
+```
+
+Run this on four distributed ranks. The framework creates a `(ring, ulysses, tp)` mesh, loads TP-local weight slices, and attaches CP hooks after loading. CP exchanges only heads owned by the TP group. TP and CP degrees must multiply to the world size; custom combined meshes, ring attention, and unvalidated model classes are rejected. CLI `--parallelism auto` selects native execution for all supported degree combinations. Select `--parallelism example` explicitly for the previous implementation.

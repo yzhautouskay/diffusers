@@ -518,6 +518,7 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
         **{f"layers.*.{mlp}.{name}": "colwise" for mlp in ("mlp", "mlp_moe_gen") for name in ("gate_proj", "up_proj")},
         **{f"layers.*.{mlp}.down_proj": "rowwise" for mlp in ("mlp", "mlp_moe_gen")},
     }
+    _supports_tp_cp_composition = True
     _cp_plan = {
         "layers.0": {
             "und_seq": ContextParallelInput(split_dim=0, expected_dims=2),

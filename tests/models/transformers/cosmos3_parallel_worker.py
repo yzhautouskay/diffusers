@@ -6,18 +6,20 @@ import json
 import os
 import resource
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
 from diffusers import Cosmos3OmniTransformer, SeaCacheConfig
-from diffusers.models._modeling_parallel import ContextParallelConfig, TensorParallelConfig
+from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelConfig, TensorParallelConfig
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--tp", type=int, default=1)
 parser.add_argument("--cp", type=int, default=1)
+parser.add_argument("--production", action="store_true")
 args = parser.parse_args()
 torch.set_float32_matmul_precision("highest")
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -28,7 +30,10 @@ device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 
 
 def parallel():
-    return ContextParallelConfig(ulysses_degree=args.cp) if args.cp > 1 else TensorParallelConfig(tp_degree=args.tp)
+    return ParallelConfig(
+        context_parallel_config=ContextParallelConfig(ulysses_degree=args.cp) if args.cp > 1 else None,
+        tensor_parallel_config=TensorParallelConfig(tp_degree=args.tp) if args.tp > 1 else None,
+    )
 
 
 def inputs(u, g, dtype):
@@ -76,9 +81,12 @@ from cosmos_parallel import (  # noqa: E402
 )
 
 
-with torch.no_grad(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+with (
+    torch.no_grad(),
+    nullcontext() if args.production else torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH),
+):
     for act in ("silu", "relu2"):
-        for dtype in (torch.float32, torch.bfloat16):
+        for dtype in (torch.bfloat16,) if args.production else (torch.float32, torch.bfloat16):
             torch.manual_seed(2026)
             model = Cosmos3OmniTransformer(
                 head_dim=8,
@@ -107,6 +115,12 @@ with torch.no_grad(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBacke
             model.set_attention_backend("native")
             ref.set_attention_backend("native")
             model.enable_parallelism(config=parallel())
+            if args.tp > 1 and args.cp > 1:
+                config = model._parallel_config
+                tp_ranks = set(dist.get_process_group_ranks(config.tensor_parallel_config._mesh.get_group()))
+                cp_ranks = set(dist.get_process_group_ranks(config.context_parallel_config._ulysses_mesh.get_group()))
+                assert len(tp_ranks) == args.tp and len(cp_ranks) == args.cp
+                assert tp_ranks & cp_ranks == {rank}
             for u, g in ((5, 7), (8, 12), (7, 5)):
                 data = inputs(u, g, dtype)
                 check(model(**data).sample[0], ref(**data).sample[0], f"full_forward_{act}_u{u}_g{g}", dtype)

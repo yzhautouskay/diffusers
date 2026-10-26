@@ -209,9 +209,7 @@ def main():
 
     tp, cp = args.tp_degree, args.cp_degree
     if args.parallelism == "auto":
-        args.parallelism = "example" if cp > 1 and tp > 1 else "native"
-    if args.parallelism == "native" and cp > 1 and tp > 1:
-        parser.error("Native TP+CP is pending mesh integration. Use --parallelism example for combined execution.")
+        args.parallelism = "native"
 
     distributed = tp * cp > 1
 
@@ -247,9 +245,12 @@ def main():
     pipeline = Cosmos3OmniModularPipeline.from_pretrained(str(pipeline_path))
     if distributed and args.parallelism == "native":
         from diffusers import Cosmos3OmniTransformer
-        from diffusers.models._modeling_parallel import ContextParallelConfig, TensorParallelConfig
+        from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelConfig, TensorParallelConfig
 
-        config = ContextParallelConfig(ulysses_degree=cp) if cp > 1 else TensorParallelConfig(tp_degree=tp)
+        config = ParallelConfig(
+            context_parallel_config=ContextParallelConfig(ulysses_degree=cp) if cp > 1 else None,
+            tensor_parallel_config=TensorParallelConfig(tp_degree=tp) if tp > 1 else None,
+        )
         transformer = Cosmos3OmniTransformer.from_pretrained(
             pipeline_path, subfolder="transformer", torch_dtype=torch.bfloat16, parallel_config=config
         )
