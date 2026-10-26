@@ -733,7 +733,7 @@ The TP degree must divide both query and KV head counts and the sharded MLP dime
 
 ### Run it
 
-The CLI uses `--parallelism auto` by default: TP-only selects native TP, while CP and combined TP+CP retain the existing example implementation. Launch one process per GPU with `--tp-degree` equal to the world size. All ranks must receive identical prompts, conditioning inputs, and seeds.
+The CLI uses `--parallelism auto` by default: TP-only and CP-only select native execution; combined TP+CP retains the existing example implementation at this stage. Launch one process per GPU with `--tp-degree` equal to the world size. All ranks must receive identical prompts, conditioning inputs, and seeds.
 
 ```bash
 torchrun --nproc_per_node=4 examples/cosmos3/inference_cosmos3.py \
@@ -787,7 +787,9 @@ Native TP retains the framework's restrictions on quantization, CPU offloading, 
 
 ## Context parallelism
 
-Context parallelism (CP) remains available through the standalone processors and helpers in [`examples/cosmos3/cosmos_parallel.py`](https://github.com/huggingface/diffusers/blob/main/examples/cosmos3/cosmos_parallel.py). Existing CP and combined TP+CP commands continue to select these helpers automatically. `--parallelism example` selects them explicitly:
+Native context parallelism (CP) uses `ContextParallelConfig(ulysses_degree=4)` and installs a standalone Cosmos processor with the existing Ulysses collectives. It shards both streams and RoPE through `_cp_plan`, handles short/empty streams by bounded padding, and preserves compact GQA where possible. See [the model documentation](../models/cosmos3_omni_transformer#native-context-parallelism).
+
+The previous implementation remains available through the standalone processors and helpers in [`examples/cosmos3/cosmos_parallel.py`](https://github.com/huggingface/diffusers/blob/main/examples/cosmos3/cosmos_parallel.py). Combined TP+CP commands continue to select these helpers automatically at this stage. `--parallelism example` selects them explicitly:
 
 ```bash
 # Sequence sharding; every rank holds the full model's weights.
@@ -801,7 +803,7 @@ torchrun --nproc_per_node=4 examples/cosmos3/inference_cosmos3.py \
 
 The example shards understanding and generation streams and their RoPE separately, pads ragged streams, and handles causal understanding, generation cross-attention, and GQA in its own processor. Its TP degree must divide the KV head count, and `tp_degree * cp_degree` must divide the query head count. Use the `native` attention backend. The helper expands KV heads before calling SDPA so flash kernels can be selected. CP alone does not reduce the weight footprint. Do not apply example helpers to a model already using native TP.
 
-Native Cosmos CP and native TP+CP composition are pending a separate design review. Existing `_cp_plan` hooks and Ulysses Anything collectives can express independent stream sharding and unequal sequence lengths; this does not require a segmented-KV dispatcher API. A Cosmos-specific processor can own causal understanding attention, GQA mapping, and mask ordering. The standard attention API is unchanged by the native TP integration.
+Native TP+CP composition requires a separate mesh/loading change. Native CP does not require a segmented-KV dispatcher API: the standalone processor owns causal understanding attention, GQA mapping, and key ordering while reusing existing tensor collectives. The standard attention API is unchanged.
 
 ## Metadata templates
 
