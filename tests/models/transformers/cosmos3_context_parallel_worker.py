@@ -1,5 +1,6 @@
 """Distributed edge cases: torchrun --standalone --nproc_per_node=4 this_file.py."""
 
+import argparse
 import copy
 import json
 import os
@@ -9,11 +10,14 @@ import torch
 import torch.distributed as dist
 
 from diffusers import Cosmos3OmniTransformer
-from diffusers.models._modeling_parallel import ContextParallelConfig
+from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelConfig, TensorParallelConfig
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.transformers.transformer_cosmos3 import _cosmos3_ulysses_attention
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--tp", type=int, default=1)
+args = parser.parse_args()
 rank = int(os.environ["RANK"])
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 dist.init_process_group("nccl")
@@ -32,7 +36,7 @@ with torch.no_grad():
     for production in (False, True):
         dtype = torch.bfloat16 if production else torch.float32
         with nullcontext() if production else torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-            for heads, kv in ((8, 4), (8, 1), (12, 3)):
+            for heads, kv in ((8, 4), (8, 1), (12, 3)) if args.tp == 1 else ((8, 4), (8, 2), (12, 6)):
                 for act in ("silu", "relu2"):
                     torch.manual_seed(42)
                     model = (
@@ -52,7 +56,12 @@ with torch.no_grad():
                     )
                     ref = copy.deepcopy(model)
                     ref.set_attention_backend("native")
-                    model.enable_parallelism(config=ContextParallelConfig(ulysses_degree=degree))
+                    model.enable_parallelism(
+                        config=ParallelConfig(
+                            context_parallel_config=ContextParallelConfig(ulysses_degree=degree // args.tp),
+                            tensor_parallel_config=TensorParallelConfig(tp_degree=args.tp) if args.tp > 1 else None,
+                        )
+                    )
                     for u, g in ((5, 7), (8, 12), (1, 2), (0, 3), (3, 0), (0, 0)):
                         und, gen = (
                             torch.randn(u, 64, device=device, dtype=dtype),
