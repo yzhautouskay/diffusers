@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from ...configuration_utils import ConfigMixin, register_to_config
+from ...hooks.hooks import HookRegistry, ModelHook
 from ...loaders import PeftAdapterMixin
 from ...utils import BaseOutput
 from .._modeling_parallel import (
@@ -196,6 +197,39 @@ def _cosmos3_ulysses_attention(
     und_out = SeqAllToAllDim.apply(group, und_out, 1, 2).squeeze(0).flatten(-2, -1)
     gen_out = SeqAllToAllDim.apply(group, gen_out, 1, 2).squeeze(0).flatten(-2, -1)
     return und_out, gen_out
+
+
+class Cosmos3ContextParallelInputHook(ModelHook):
+    def __init__(self, degree, processors=()):
+        super().__init__()
+        self.degree = degree
+        self.processors = processors
+        self.sequence_lengths = None
+
+    def _pad(self, tensor):
+        padded = max(self.degree, math.ceil(tensor.shape[0] / self.degree) * self.degree)
+        if padded == tensor.shape[0]:
+            return tensor
+        return torch.nn.functional.pad(tensor, (0, 0, 0, padded - tensor.shape[0]))
+
+    def pre_forward(self, module, und_seq, gen_seq, rotary_emb):
+        if self.processors:
+            self.sequence_lengths = (und_seq.shape[0], gen_seq.shape[0])
+            for processor in self.processors:
+                processor._sequence_lengths = self.sequence_lengths
+            und_seq, gen_seq = self._pad(und_seq), self._pad(gen_seq)
+        rotary_emb = tuple(self._pad(tensor) for tensor in rotary_emb)
+        return (und_seq, gen_seq, rotary_emb), {}
+
+
+class Cosmos3ContextParallelOutputHook(ModelHook):
+    def __init__(self, input_hook, stream_index):
+        super().__init__()
+        self.input_hook = input_hook
+        self.stream_index = stream_index
+
+    def post_forward(self, module, output):
+        return output[: self.input_hook.sequence_lengths[self.stream_index]]
 
 
 class Cosmos3UlyssesAttnProcessor:
@@ -570,6 +604,19 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
             self.set_attn_processor({name: Cosmos3UlyssesAttnProcessor() for name in self.attn_processors})
         return resolved
 
+    def _apply_context_parallel(self, config, cp_plan=None):
+        super()._apply_context_parallel(config, cp_plan)
+        cp = config.context_parallel_config
+        if cp is not None:
+            input_hook = Cosmos3ContextParallelInputHook(cp.ulysses_degree, tuple(self.attn_processors.values()))
+            for index, layer in enumerate(self.layers):
+                hook = input_hook if index == 0 else Cosmos3ContextParallelInputHook(cp.ulysses_degree)
+                HookRegistry.check_if_exists_or_initialize(layer).register_hook(hook, "cosmos3_cp_input")
+            for index, norm in enumerate((self.norm, self.norm_moe_gen)):
+                HookRegistry.check_if_exists_or_initialize(norm).register_hook(
+                    Cosmos3ContextParallelOutputHook(input_hook, index), "cosmos3_cp_output"
+                )
+
     @register_to_config
     def __init__(
         self,
@@ -833,24 +880,6 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
         gen_seq: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cp = self._parallel_config.context_parallel_config if self._parallel_config is not None else None
-        if cp is not None:
-            und_length, gen_length = und_seq.shape[0], gen_seq.shape[0]
-            degree = cp.ulysses_degree
-
-            # Bound padding to fewer than CP tokens per nonempty stream. Empty
-            # streams get one dummy token per rank so all collectives stay uniform.
-            def pad(tensor):
-                padded = max(degree, math.ceil(tensor.shape[0] / degree) * degree)
-                if padded == tensor.shape[0]:
-                    return tensor
-                return torch.nn.functional.pad(tensor, (0, 0, 0, padded - tensor.shape[0]))
-
-            und_seq, gen_seq = pad(und_seq), pad(gen_seq)
-            rotary_emb = tuple(pad(tensor) for tensor in rotary_emb)
-            for layer in self.layers:
-                layer.self_attn.processor._sequence_lengths = (und_length, gen_length)
-
         for decoder_layer in self.layers:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 und_seq, gen_seq = self._gradient_checkpointing_func(
@@ -859,10 +888,7 @@ class Cosmos3OmniTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, Attentio
             else:
                 und_seq, gen_seq = decoder_layer(und_seq, gen_seq, rotary_emb)
 
-        und_seq, gen_seq = self.norm(und_seq), self.norm_moe_gen(gen_seq)
-        if cp is not None:
-            return und_seq[:und_length], gen_seq[:gen_length]
-        return und_seq, gen_seq
+        return self.norm(und_seq), self.norm_moe_gen(gen_seq)
 
     # -------------------------------------------------------------------------
     # forward: full per-step pass — encode text/vision/sound/action → run layers →
