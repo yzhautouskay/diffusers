@@ -1930,6 +1930,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 tp_shard_specs=tp_shard_specs,
                 tp_config=tp_config,
                 dtype=dtype,
+                hf_quantizer=hf_quantizer,
                 keep_in_fp32_modules=keep_in_fp32_modules,
                 unexpected_keys=unexpected_keys,
                 ignore_mismatched_sizes=ignore_mismatched_sizes,

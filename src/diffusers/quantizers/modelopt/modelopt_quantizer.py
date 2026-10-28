@@ -37,6 +37,41 @@ class NVIDIAModelOptQuantizer(DiffusersQuantizer):
     def __init__(self, quantization_config, **kwargs):
         super().__init__(quantization_config, **kwargs)
 
+    @property
+    def supports_tensor_parallel(self):
+        config = self.quantization_config
+        return (
+            self.pre_quantized
+            and config.quant_type == "FP8_FP8"
+            and config.channel_quantize is None
+            and config.block_quantize is None
+        )
+
+    def get_tensor_parallel_dtype(self, model, param_name, param, dtype):
+        from modelopt.torch.quantization.nn import TensorQuantizer
+
+        module, tensor_name = get_module_from_name(model, param_name)
+        if param.dtype == torch.float8_e4m3fn:
+            quantizer = getattr(module, "weight_quantizer", None)
+            if tensor_name != "weight" or not isinstance(quantizer, TensorQuantizer):
+                raise ValueError(
+                    f"{param_name} requires a restored ModelOpt FP8 Linear. "
+                    "Enable ModelOpt Hugging Face checkpointing and provide `modelopt_state.pth` with the checkpoint."
+                )
+            scale = getattr(quantizer, "_scale", None)
+            if quantizer.axis is not None or quantizer.block_sizes or scale is None or scale.numel() != 1:
+                raise ValueError("ModelOpt tensor parallel loading currently requires tensorwise FP8 weights.")
+        return self.get_loading_dtype(model, param_name, param, dtype)
+
+    def get_loading_dtype(self, model, param_name, param, dtype):
+        from modelopt.torch.quantization.nn import TensorQuantizer
+
+        if self.pre_quantized:
+            module, _ = get_module_from_name(model, param_name)
+            if param.dtype == torch.float8_e4m3fn or isinstance(module, TensorQuantizer):
+                return param.dtype
+        return dtype
+
     def validate_environment(self, *args, **kwargs):
         if not is_nvidia_modelopt_available():
             raise ImportError(

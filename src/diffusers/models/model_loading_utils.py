@@ -231,10 +231,13 @@ def load_model_dict_into_meta(
             continue
 
         set_module_kwargs = {}
+        param_dtype = dtype
+        if hf_quantizer is not None:
+            param_dtype = hf_quantizer.get_loading_dtype(model, param_name, param, dtype)
         # We convert floating dtypes to the `dtype` passed. We also want to keep the buffers/params
         # in int/uint/bool and not cast them.
         # TODO: revisit cases when param.dtype == torch.float8_e4m3fn
-        if dtype is not None and torch.is_floating_point(param):
+        if param_dtype is not None and torch.is_floating_point(param):
             if keep_in_fp32_modules is not None and any(
                 module_to_keep_in_fp32 in param_name.split(".") for module_to_keep_in_fp32 in keep_in_fp32_modules
             ):
@@ -244,8 +247,8 @@ def load_model_dict_into_meta(
             elif hf_quantizer is not None and param.dtype == getattr(torch, "float8_e4m3fn", None):
                 pass
             else:
-                param = param.to(dtype)
-                set_module_kwargs["dtype"] = dtype
+                param = param.to(param_dtype)
+                set_module_kwargs["dtype"] = param_dtype
 
         if is_accelerate_version(">", "1.8.1"):
             set_module_kwargs["non_blocking"] = True
@@ -391,6 +394,7 @@ def _load_shard_file_tp(
     keep_in_fp32_modules=None,
     unexpected_keys=None,
     ignore_mismatched_sizes=False,
+    hf_quantizer=None,
 ):
     """Load one safetensors shard, reading only this rank's slice of each tensor-parallel parameter.
 
@@ -444,13 +448,16 @@ def _load_shard_file_tp(
 
             # Mirror `load_model_dict_into_meta`: only floating point weights are cast, and modules held
             # in fp32 override the requested dtype.
-            if dtype is not None and torch.is_floating_point(param):
+            param_dtype = dtype
+            if hf_quantizer is not None:
+                param_dtype = hf_quantizer.get_tensor_parallel_dtype(model, key, param, dtype)
+            if param_dtype is not None and torch.is_floating_point(param):
                 if keep_in_fp32_modules is not None and any(
                     module_to_keep_in_fp32 in key.split(".") for module_to_keep_in_fp32 in keep_in_fp32_modules
                 ):
                     param = param.to(torch.float32)
                 else:
-                    param = param.to(dtype)
+                    param = param.to(param_dtype)
 
             if spec is None:
                 set_module_tensor_to_device(model, key, device, value=param, dtype=param.dtype)

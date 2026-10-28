@@ -740,6 +740,22 @@ launching, seeding, and rank-zero output handling. For Cosmos, adapt the
 Nano and Super support TP degrees 1, 2, 4, and 8; the degree must divide the query and KV head counts
 and the MLP intermediate size. For Cosmos CP or combined TP+CP, use the [existing example helpers](#context-parallelism).
 
+### Pre-quantized FP8 checkpoints
+
+Tensorwise, pre-quantized ModelOpt `FP8_FP8` checkpoints such as
+[`nvidia/Cosmos3-Super-FP8`](https://huggingface.co/nvidia/Cosmos3-Super-FP8) also support native TP.
+
+Follow the [ModelOpt restoration instructions](../../quantization/modelopt#serializing-and-deserializing-quantized-models):
+call `modelopt.torch.opt.enable_huggingface_checkpointing()` and import
+`modelopt.torch.quantization.backends.fp8_per_tensor_gemm` before loading. Download the checkpoint locally
+and pass its `transformer` directory directly to `Cosmos3OmniTransformer.from_pretrained` so ModelOpt finds
+`modelopt_state.pth` beside the weights. Use the same TP config and modular component setup described above.
+
+Weights remain FP8 and scales remain FP32. The checkpoint's
+[mixed W8A8/W8A16 schedule](#fp8-mixed-w8a8w8a16-denoising) applies automatically.
+Use the pipeline's default `no_grad` execution; an outer `torch.inference_mode()` can fail on DTensor scalar checks.
+Quantizing during loading, channel/block quantization, and applying TP after loading quantized weights remain unsupported.
+
 ## Context parallelism
 
 For long videos or high resolutions, a single forward pass can exceed the memory and latency budget of one GPU. Cosmos 3 supports **context parallelism (CP)** to shard the sequence dimension across multiple GPUs, splitting the attention computation so each device holds only a slice of the tokens.

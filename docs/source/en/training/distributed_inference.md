@@ -494,9 +494,9 @@ For a TP group within a larger distributed job, pass its one-dimensional `Device
 `TensorParallelConfig(mesh=tp_mesh)` instead.
 
 > [!CAUTION]
-> Loading with a tensor-parallel `parallel_config` isn't supported yet with `device_map`, `quantization_config`, `low_cpu_mem_usage=False`, `use_flashpack=True`, or non-safetensors weights; each raises rather than quietly falling back to loading the full checkpoint.
+> Loading with a tensor-parallel `parallel_config` isn't supported yet with `device_map`, `low_cpu_mem_usage=False`, `use_flashpack=True`, or non-safetensors weights; each raises rather than quietly falling back to loading the full checkpoint.
 >
-> Combining tensor parallelism with quantization, offloading, or LoRA adapters isn't supported yet either, so those raise however the model is sharded.
+> Quantization requires a quantizer that supports sharded loading. Tensorwise, pre-quantized ModelOpt `FP8_FP8` checkpoints are supported; see the [Cosmos 3 FP8 example](../api/pipelines/cosmos3#pre-quantized-fp8-checkpoints). Other quantization configurations, offloading, and LoRA adapters remain unsupported. Applying `enable_parallelism` to an already quantized model is also unsupported; pass `parallel_config` when loading instead.
 >
 > To shard a model that is already in memory, call [`~ModelMixin.enable_parallelism`] with the same config instead — that loads everything first and reshards it, so it costs full checkpoint memory on every rank.
 

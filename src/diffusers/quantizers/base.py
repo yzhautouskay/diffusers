@@ -50,6 +50,15 @@ class DiffusersQuantizer(ABC):
 
     requires_calibration = False
     required_packages = None
+    supports_tensor_parallel = False
+
+    def get_loading_dtype(self, model, param_name, param, dtype):
+        """Select the checkpoint tensor's dtype before installing it in the model."""
+        return dtype
+
+    def get_tensor_parallel_dtype(self, model, param_name, param, dtype):
+        """Select the storage dtype of a checkpoint tensor before installing its local TP shard."""
+        return self.get_loading_dtype(model, param_name, param, dtype)
 
     def __init__(self, quantization_config: QuantizationConfigMixin, **kwargs):
         self.quantization_config = quantization_config

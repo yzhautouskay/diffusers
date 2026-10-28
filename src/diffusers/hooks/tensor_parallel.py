@@ -404,11 +404,10 @@ def _check_tp_supported(
             "`device_map` cannot be combined with a tensor-parallel `parallel_config`: tensor parallelism "
             "already places each rank's shard on that rank's device. Drop `device_map`."
         )
-    if hf_quantizer is not None:
+    if hf_quantizer is not None and not hf_quantizer.supports_tensor_parallel:
         raise ValueError(
-            "`quantization_config` cannot be combined with a tensor-parallel `parallel_config`: quantized "
-            "parameters are packed into a quantizer-specific layout that cannot be sharded into `DTensor`s. "
-            "Load the model unquantized to shard it."
+            "This quantization configuration does not support tensor-parallel checkpoint loading. "
+            "Load unquantized weights or a supported pre-quantized checkpoint."
         )
     if not low_cpu_mem_usage:
         raise ValueError(
@@ -429,9 +428,9 @@ def _check_tp_supported(
     if model is not None:
         if getattr(model, "hf_quantizer", None) is not None or getattr(model, "is_quantized", False):
             raise ValueError(
-                f"'{model.__class__.__name__}' is quantized, which cannot be combined with tensor parallelism: its "
-                "parameters are packed into a quantizer-specific layout that cannot be sharded into `DTensor`s. Load "
-                "the model unquantized to shard it."
+                "Applying tensor parallelism to an already quantized model is not supported. "
+                "For a supported pre-quantized checkpoint, pass `parallel_config` to `from_pretrained` "
+                "to shard the weights during loading."
             )
 
         from .group_offloading import _is_group_offload_enabled
