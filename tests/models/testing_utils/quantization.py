@@ -20,6 +20,9 @@ import tempfile
 import pytest
 import safetensors.torch
 import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
 
 from diffusers import (
     AutoRoundConfig,
@@ -31,7 +34,10 @@ from diffusers import (
     SDNQConfig,
     TorchAoConfig,
 )
+from diffusers.hooks.tensor_parallel import _check_tp_supported, resolve_tp_shard_specs
 from diffusers.loaders.single_file_model import SINGLE_FILE_LOADABLE_CLASSES, _get_single_file_loadable_mapping_class
+from diffusers.models._modeling_parallel import TensorParallelConfig
+from diffusers.models.model_loading_utils import _load_shard_file_tp, load_model_dict_into_meta
 from diffusers.utils.import_utils import (
     is_bitsandbytes_available,
     is_flashinfer_available,
@@ -1281,6 +1287,168 @@ class ModelOptTesterMixin(ModelOptConfigMixin, QuantizationTesterMixin):
     def test_modelopt_dequantize(self):
         """Test that dequantize() works correctly."""
         self._test_dequantize(ModelOptConfigMixin.MODELOPT_CONFIGS["fp8"])
+
+
+@is_quantization
+@is_modelopt
+class ModelOptTensorParallelTesterMixin:
+    @pytest.fixture
+    def cpu_tp_config(self, tmp_path):
+        if not dist.is_available() or not dist.is_gloo_available():
+            pytest.skip("This loader test requires Gloo.")
+        dist.init_process_group("gloo", init_method=(tmp_path / "rendezvous").as_uri(), rank=0, world_size=1)
+        try:
+            mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+            config = TensorParallelConfig(mesh=mesh)
+            config.setup(rank=0, world_size=1, device=torch.device("cpu"), mesh=mesh)
+            yield config
+        finally:
+            dist.destroy_process_group()
+
+    @pytest.fixture
+    def quantized_checkpoint(self, tmp_path):
+        mtq = pytest.importorskip("modelopt.torch.quantization")
+        mto = pytest.importorskip("modelopt.torch.opt")
+        torch.manual_seed(0)
+        source = torch.nn.ModuleDict(
+            {
+                "projection": torch.nn.Linear(16, 32, bias=False, dtype=torch.bfloat16),
+                "time_embedder": torch.nn.Linear(16, 16, dtype=torch.float32),
+            }
+        )
+        quant_config = {
+            "quant_cfg": [
+                {"quantizer_name": "*", "enable": False},
+                {
+                    "quantizer_name": "projection.weight_quantizer",
+                    "cfg": {"num_bits": (4, 3), "axis": None, "fake_quant": False},
+                },
+            ],
+            "algorithm": "max",
+        }
+        with torch.no_grad():
+            mtq.quantize(source, quant_config)
+            mtq.compress(source)
+        for module in source.modules():
+            if isinstance(module, mtq.nn.TensorQuantizer):
+                module.float()
+        checkpoint = tmp_path / "fp8.safetensors"
+        weights = source.state_dict()
+        safetensors.torch.save_file(weights, checkpoint)
+        with torch.device("meta"):
+            model = torch.nn.ModuleDict(
+                {
+                    "projection": torch.nn.Linear(16, 32, bias=False, dtype=torch.bfloat16),
+                    "time_embedder": torch.nn.Linear(16, 16, dtype=torch.bfloat16),
+                }
+            )
+            mto.restore_from_modelopt_state(model, mto.modelopt_state(source))
+        return model, checkpoint, weights, quant_config
+
+    @pytest.mark.parametrize("style", ["colwise", "rowwise"])
+    def test_preserves_fp8_storage_and_scales(self, quantized_checkpoint, cpu_tp_config, style):
+        from diffusers import NVIDIAModelOptConfig
+        from diffusers.quantizers.modelopt import NVIDIAModelOptQuantizer
+
+        model, checkpoint, weights, quant_config = quantized_checkpoint
+        quantizer = NVIDIAModelOptQuantizer(
+            NVIDIAModelOptConfig(quant_type="FP8", modelopt_config=quant_config), pre_quantized=True
+        )
+        specs = resolve_tp_shard_specs(model, {"projection": style}, 1)
+        _load_shard_file_tp(
+            str(checkpoint),
+            model,
+            model.state_dict(),
+            specs,
+            cpu_tp_config,
+            dtype=torch.bfloat16,
+            hf_quantizer=quantizer,
+            keep_in_fp32_modules=["time_embedder"],
+            unexpected_keys=[],
+        )
+        weight = model["projection"].weight
+        assert isinstance(weight, DTensor)
+        assert weight.dtype == torch.float8_e4m3fn
+        torch.testing.assert_close(
+            weight.to_local().view(torch.uint8), weights["projection.weight"].view(torch.uint8), atol=0, rtol=0
+        )
+        for name, buffer in model.named_buffers():
+            assert buffer.dtype == torch.float32
+            torch.testing.assert_close(buffer, weights[name], atol=0, rtol=0)
+        for name, parameter in model["time_embedder"].named_parameters():
+            torch.testing.assert_close(parameter, weights[f"time_embedder.{name}"], atol=0, rtol=0)
+
+    def test_regular_loading_preserves_fp32_quantizer_state(self, quantized_checkpoint):
+        from diffusers import NVIDIAModelOptConfig
+        from diffusers.quantizers.modelopt import NVIDIAModelOptQuantizer
+
+        model, _, weights, quant_config = quantized_checkpoint
+        quantizer = NVIDIAModelOptQuantizer(
+            NVIDIAModelOptConfig(quant_type="FP8", modelopt_config=quant_config), pre_quantized=True
+        )
+        load_model_dict_into_meta(
+            model,
+            weights,
+            dtype=torch.bfloat16,
+            hf_quantizer=quantizer,
+            keep_in_fp32_modules=["time_embedder"],
+            unexpected_keys=[],
+        )
+        assert model["projection"].weight.dtype == torch.float8_e4m3fn
+        for name, buffer in model.named_buffers():
+            assert buffer.dtype == torch.float32
+            torch.testing.assert_close(buffer, weights[name], atol=0, rtol=0)
+
+    @pytest.mark.parametrize(
+        "config_kwargs,pre_quantized",
+        [
+            ({"quant_type": "FP8_FP8"}, False),
+            ({"quant_type": "FP8"}, True),
+            ({"quant_type": "NVFP4"}, True),
+            ({"quant_type": "FP8_FP8", "channel_quantize": 0}, True),
+            ({"quant_type": "FP8_FP8", "block_quantize": 16}, True),
+        ],
+    )
+    def test_rejects_unsupported_quantization(self, config_kwargs, pre_quantized):
+        mtq = pytest.importorskip("modelopt.torch.quantization")
+        from diffusers import NVIDIAModelOptConfig
+        from diffusers.quantizers.modelopt import NVIDIAModelOptQuantizer
+
+        modelopt_config = mtq.NVFP4_DEFAULT_CFG if config_kwargs["quant_type"] == "NVFP4" else mtq.FP8_DEFAULT_CFG
+        quantizer = NVIDIAModelOptQuantizer(
+            NVIDIAModelOptConfig(**config_kwargs, modelopt_config=modelopt_config), pre_quantized=pre_quantized
+        )
+        with pytest.raises(ValueError, match="does not support tensor-parallel checkpoint loading"):
+            _check_tp_supported(
+                "ModuleDict",
+                {"projection": "colwise"},
+                None,
+                TensorParallelConfig(tp_degree=2),
+                hf_quantizer=quantizer,
+            )
+
+    def test_requires_restored_modelopt_state(self, quantized_checkpoint, cpu_tp_config):
+        from diffusers import NVIDIAModelOptConfig
+        from diffusers.quantizers.modelopt import NVIDIAModelOptQuantizer
+
+        _, checkpoint, _, quant_config = quantized_checkpoint
+        with torch.device("meta"):
+            model = torch.nn.ModuleDict({"projection": torch.nn.Linear(16, 32, bias=False)})
+        quantizer = NVIDIAModelOptQuantizer(
+            NVIDIAModelOptConfig(quant_type="FP8", modelopt_config=quant_config), pre_quantized=True
+        )
+        specs = resolve_tp_shard_specs(model, {"projection": "colwise"}, 1)
+        with pytest.raises(ValueError, match="requires a restored ModelOpt FP8 Linear"):
+            _load_shard_file_tp(
+                str(checkpoint),
+                model,
+                model.state_dict(),
+                specs,
+                cpu_tp_config,
+                dtype=torch.bfloat16,
+                hf_quantizer=quantizer,
+                unexpected_keys=[],
+            )
 
 
 @is_quantization
